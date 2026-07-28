@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: agente_soporte_mvp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d agente_soporte_mvp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Migraciones con el admin (crean extensiones y el rol de la app)...
+      ADMIN_DATABASE_URL: postgresql+asyncpg://user:password@localhost:5432/agente_soporte_mvp
+      # ...y la app/los tests con app_agente, sin BYPASSRLS, para que RLS aplique
+      # de verdad. Con el admin, los tests de aislamiento pasarian sin probar nada.
+      DATABASE_URL: postgresql+asyncpg://app_agente:app_password_dev@localhost:5432/agente_soporte_mvp
+      APP_DB_PASSWORD: app_password_dev
+      # Secretos ficticios: la fase 1 no llama a APIs externas, pero config.py
+      # los exige en startup.
+      ANTHROPIC_API_KEY: sk-ant-test
+      WHATSAPP_PHONE_NUMBER_ID: test
+      WHATSAPP_WABA_ID: test
+      WHATSAPP_ACCESS_TOKEN: test
+      WHATSAPP_APP_SECRET: test
+      WHATSAPP_VERIFY_TOKEN: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Tipos (mypy)
+        run: mypy app scripts
+
+      - name: Migraciones desde cero
+        run: alembic upgrade head
+
+      - name: Tests
+        run: pytest -q
+
+      # Los seeds son la vía de onboarding de un tenant: si se rompen, se nota
+      # recién al querer probar el agente a mano.
+      - name: Seeds de desarrollo
+        run: python -m scripts.seed_dev

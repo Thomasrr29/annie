@@ -1,0 +1,70 @@
+"""
+Configuración centralizada de la aplicación.
+Lee del .env y valida tipos/valores en startup.
+"""
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Variables de entorno tipadas. Lanzar excepción si falta algo crítico."""
+
+    # --- Base de Datos ---
+    database_url: str = Field(..., description="PostgreSQL connection string")
+    database_pool_size: int = Field(default=10)
+    database_max_overflow: int = Field(default=20)
+
+    # --- Anthropic API ---
+    anthropic_api_key: str = Field(..., description="API key de Anthropic")
+    anthropic_model_classify: str = Field(
+        default="claude-3-5-haiku-20241022",
+        description="Modelo Haiku para clasificación de intención",
+    )
+    anthropic_model_respond: str = Field(
+        default="claude-3-5-sonnet-20241022",
+        description="Modelo Sonnet para componer respuestas",
+    )
+
+    # --- WhatsApp Cloud API (Meta) ---
+    whatsapp_phone_number_id: str = Field(
+        ..., description="Phone Number ID del número registrado en Meta"
+    )
+    whatsapp_waba_id: str = Field(..., description="WhatsApp Business Account ID")
+    whatsapp_access_token: str = Field(
+        ..., description="Access token permanente de System User (token de portador)"
+    )
+    whatsapp_app_secret: str = Field(
+        ..., description="App secret para verificar firma HMAC del webhook"
+    )
+    whatsapp_verify_token: str = Field(
+        ..., description="Verify token arbitrario configurado en Meta for Developers"
+    )
+
+    # --- FastAPI ---
+    env: str = Field(default="development")
+    debug: bool = Field(default=False)
+    log_level: str = Field(default="INFO")
+    api_base_url: str = Field(
+        default="https://localhost:8000",
+        description="URL pública para el callback del webhook",
+    )
+
+    # --- General ---
+    timezone: str = Field(default="America/Bogota")
+    language: str = Field(default="es")
+
+    # --- Observabilidad ---
+    sentry_dsn: str | None = Field(default=None)
+    enable_metrics: bool = Field(default=False)
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+
+# Instancia global (singleton)
+settings = Settings()

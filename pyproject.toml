@@ -1,0 +1,62 @@
+[project]
+name = "agente-soporte-mvp"
+version = "0.1.0"
+description = "Plataforma SaaS multi-tenant de agentes conversacionales de soporte para pymes"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "alembic>=1.14.0",
+    "pgvector>=0.3.6",
+    "anthropic>=0.40.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "mypy>=1.13.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*", "scripts*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "migrations/versions", "app/scaffold_referencia.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# UP042: sugiere StrEnum en vez de (str, Enum). El scaffold de referencia
+# (contrato de diseño) usa (str, Enum), que además es el patrón que Pydantic y
+# FastAPI documentan para enums serializables. Mantener la forma del contrato.
+ignore = ["UP042"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["migrations/", "app/scaffold_referencia.py"]
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*", "asyncpg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# Los tests importan `tests.conftest` y `scripts.seed_dev`, así que la raíz del
+# proyecto tiene que estar en sys.path. Sin esto falla la recolección en un
+# entorno limpio (CI), aunque localmente funcione por el editable install.
+pythonpath = ["."]

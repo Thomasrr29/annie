@@ -1,0 +1,232 @@
+"""
+Modelos Pydantic: contratos de frontera (canal <-> orquestador <-> API).
+
+Portado de `app/scaffold_referencia.py` bloque 1, que es el contrato de diseno.
+Las enumeraciones evitan strings sueltos entre capas.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Any
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ------------------------------------------------------------------
+# Enumeraciones (contratos cerrados)
+# ------------------------------------------------------------------
+class Intent(str, Enum):
+    """Los 7 flujos conversacionales F1-F7."""
+
+    INFORM = "inform"      # F1: consulta de informacion
+    ACT = "act"            # F2: ejecutar/capturar accion
+    GREET = "greet"        # F3: saludo / social
+    CLARIFY = "clarify"    # F4: pedir aclaracion
+    CONTINUE = "continue"  # F5: continuar flujo activo
+    ESCALATE = "escalate"  # F6: derivar a humano
+    FALLBACK = "fallback"  # F7: fuera de alcance
+
+
+class ConversationStatus(str, Enum):
+    AUTO = "auto"    # el agente responde
+    HUMAN = "human"  # modo humano: el agente calla (F6)
+
+
+class MessageRole(str, Enum):
+    CUSTOMER = "customer"
+    AGENT = "agent"
+    SYSTEM = "system"
+    HUMAN = "human"  # operador del negocio
+
+
+class RequestStatus(str, Enum):
+    NEW = "new"
+    SEEN = "seen"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+
+class EscalationStatus(str, Enum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+
+
+class MemoryScope(str, Enum):
+    NONE = "none"
+    CUSTOMER = "customer"
+
+
+# ------------------------------------------------------------------
+# Mensaje normalizado (frontera canal <-> orquestador)
+# ------------------------------------------------------------------
+class InboundMessage(BaseModel):
+    """Formato comun, agnostico al canal. Lo produce el adaptador."""
+
+    business_id: UUID
+    channel: str = "whatsapp"
+    channel_identifier: str  # numero de telefono en WhatsApp
+    text: str
+    external_message_id: str | None = None
+    received_at: datetime
+    # Nombre del perfil del canal, si viene. Sirve para saludar por el nombre sin
+    # tener que preguntarlo.
+    display_name: str | None = None
+
+
+class OutboundMessage(BaseModel):
+    """Respuesta a enviar de vuelta por el canal saliente."""
+
+    business_id: UUID
+    channel: str
+    channel_identifier: str
+    text: str
+
+
+# ------------------------------------------------------------------
+# Configuracion cargada en runtime
+# ------------------------------------------------------------------
+class BusinessConfig(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    persona_tone: str | None = None
+    language: str = "es"
+    timezone: str = "America/Bogota"
+    business_hours: dict[str, Any] = Field(default_factory=dict)
+    notify_channel: str | None = None
+    notify_config: dict[str, Any] = Field(default_factory=dict)
+    # Conocimiento "base completa": texto estable que va al prefijo cacheado
+    # del prompt (RNF-02). Debe ser deterministico: mismo input => mismo string.
+    knowledge_context: str | None = None
+
+
+class AgentConfig(BaseModel):
+    """Un 'agente' es config, no un proceso: enrutar = leer estos registros."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    business_id: UUID
+    name: str
+    routing_description: str
+    instructions_md: str
+    allowed_tools: list[str] = Field(default_factory=list)
+    memory_scope: MemoryScope = MemoryScope.CUSTOMER
+    response_style: str | None = None
+    status: str = "active"
+
+
+# ------------------------------------------------------------------
+# Contexto de conversacion
+# ------------------------------------------------------------------
+class ConversationTurn(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    role: MessageRole
+    content: str
+    created_at: datetime
+
+
+class CustomerMemory(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    customer_id: UUID
+    profile: dict[str, Any] = Field(default_factory=dict)
+    summary: str | None = None
+
+
+class ConversationContext(BaseModel):
+    """Todo lo que el orquestador necesita para razonar este turno."""
+
+    conversation_id: UUID
+    customer_id: UUID
+    status: ConversationStatus
+    active_agent_id: UUID | None = None
+    flow_state: dict[str, Any] = Field(default_factory=dict)  # datos parciales (F5)
+    recent_turns: list[ConversationTurn] = Field(default_factory=list)
+    customer_memory: CustomerMemory | None = None
+
+
+# ------------------------------------------------------------------
+# I/O de herramientas integradas
+# ------------------------------------------------------------------
+class KnowledgeHit(BaseModel):
+    content: str
+    score: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CaptureRequestInput(BaseModel):
+    request_type: str  # 'agenda' | 'pedido' | ...
+    structured_data: dict[str, Any]
+
+
+# ------------------------------------------------------------------
+# Resultado del turno (orquestador)
+# ------------------------------------------------------------------
+class HandlerResult(BaseModel):
+    reply_text: str
+    tools_used: list[str] = Field(default_factory=list)
+    new_flow_state: dict[str, Any] | None = None
+    escalate: bool = False
+
+
+class TurnUsage(BaseModel):
+    """Consumo del turno. cache_read_tokens mide el ahorro de caché (RNF-02)."""
+
+    model_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_estimate_usd: float | None = None
+    latency_ms: int | None = None
+
+
+# ------------------------------------------------------------------
+# Modelos de la API admin
+# ------------------------------------------------------------------
+class AgentCreate(BaseModel):
+    name: str
+    routing_description: str
+    instructions_md: str
+    allowed_tools: list[str] = Field(default_factory=list)
+    memory_scope: MemoryScope = MemoryScope.CUSTOMER
+    response_style: str | None = None
+
+
+class KnowledgeUpload(BaseModel):
+    title: str
+    source: str = "upload"
+    raw_content: str
+
+
+class WhatsAppAck(BaseModel):
+    status: str = "received"
+
+
+__all__ = [
+    "AgentConfig",
+    "AgentCreate",
+    "BusinessConfig",
+    "CaptureRequestInput",
+    "ConversationContext",
+    "ConversationStatus",
+    "ConversationTurn",
+    "CustomerMemory",
+    "EscalationStatus",
+    "HandlerResult",
+    "InboundMessage",
+    "Intent",
+    "KnowledgeHit",
+    "KnowledgeUpload",
+    "MemoryScope",
+    "MessageRole",
+    "OutboundMessage",
+    "RequestStatus",
+    "TurnUsage",
+    "WhatsAppAck",
+]
