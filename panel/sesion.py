@@ -79,6 +79,9 @@ def requerir_api() -> AdminAPI:
     if api is None:
         st.info("Ingresá la URL de la API y tu token de acceso en la barra lateral.")
         st.stop()
+        # st.stop() no retorna, pero en CI Streamlit no se instala (es el extra
+        # [panel]) y para mypy `st` es Any: sin esta línea no sabe que aquí se corta.
+        raise RuntimeError("st.stop() no detuvo la página")
     return api
 
 

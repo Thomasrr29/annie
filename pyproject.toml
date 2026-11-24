@@ -8,7 +8,10 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
-    "sqlalchemy[asyncio]>=2.0.36",
+    # <2.1: la 2.1 cambió los genéricos de Select (TypeVarTuple) y el código está
+    # tipado para la 2.0. Sin tope, el CI instalaba 2.1 y mypy fallaba mientras en
+    # local pasaba con 2.0. Migrar a 2.1 es una decisión aparte.
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
     "asyncpg>=0.30.0",
     "alembic>=1.14.0",
     "pgvector>=0.3.6",
