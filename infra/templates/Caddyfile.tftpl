@@ -1,0 +1,14 @@
+# Generado por Terraform. Caddy pide y renueva el certificado HTTPS solo (Let's Encrypt).
+${domain} {
+	encode gzip
+
+	# Panel Streamlit (corre con baseUrlPath=panel, así que no se quita el prefijo).
+	handle /panel* {
+		reverse_proxy panel:8501
+	}
+
+	# Todo lo demás: la API (webhook de WhatsApp, /admin, /health).
+	handle {
+		reverse_proxy api:8000
+	}
+}

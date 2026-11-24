@@ -17,18 +17,23 @@ import pytest
 
 from app.config import settings
 from app.core.channel_whatsapp import (
+    MAX_IMAGE_BYTES,
+    InvalidMedia,
     SignatureError,
     UnsupportedMessageType,
     WhatsAppError,
     _split_long_text,
     adapt_whatsapp_payload,
+    check_image,
+    download_whatsapp_media,
     extract_phone_number_id,
     is_status_update,
+    send_whatsapp_image,
     send_whatsapp_reply,
     verify_subscription,
     verify_webhook_signature,
 )
-from app.schemas import OutboundMessage
+from app.schemas import IMAGE_PLACEHOLDER, ContentType, OutboundMessage
 
 
 def _payload_texto(
@@ -146,9 +151,9 @@ def test_phone_number_id_ausente_devuelve_none() -> None:
     assert extract_phone_number_id({"entry": []}) is None
 
 
-@pytest.mark.parametrize("tipo", ["audio", "image", "location", "sticker", "document"])
+@pytest.mark.parametrize("tipo", ["audio", "location", "sticker", "document", "video"])
 def test_tipos_no_soportados_se_senalan(tipo: str) -> None:
-    """El MVP solo lee texto; el llamador responde con amabilidad."""
+    """El MVP lee texto e imagen; el resto se contesta con amabilidad."""
     with pytest.raises(UnsupportedMessageType) as exc:
         adapt_whatsapp_payload(_payload_texto(tipo=tipo), uuid4())
 
@@ -184,6 +189,155 @@ def test_payload_sin_mensaje_falla_claro() -> None:
 def test_texto_vacio_se_rechaza() -> None:
     with pytest.raises(WhatsAppError):
         adapt_whatsapp_payload(_payload_texto(texto="   "), uuid4())
+
+
+# ======================================================================
+# Imagenes
+# ======================================================================
+def _payload_imagen(caption: str | None = None) -> dict[str, Any]:
+    payload = _payload_texto(tipo="image")
+    imagen: dict[str, Any] = {"id": "MEDIA123", "mime_type": "image/jpeg"}
+    if caption is not None:
+        imagen["caption"] = caption
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["image"] = imagen
+    return payload
+
+
+def test_adapta_imagen_con_pie_de_foto() -> None:
+    inbound = adapt_whatsapp_payload(_payload_imagen("¿tienen este modelo?"), uuid4())
+
+    assert inbound.media is not None
+    assert inbound.media.content_type == ContentType.IMAGE
+    assert inbound.media.external_media_id == "MEDIA123"
+    assert inbound.media.mime_type == "image/jpeg"
+    assert inbound.media.caption == "¿tienen este modelo?"
+    # El modelo no ve la foto: lee el marcador y el pie.
+    assert inbound.text == f"{IMAGE_PLACEHOLDER} ¿tienen este modelo?"
+
+
+def test_imagen_sin_pie_llega_como_marcador() -> None:
+    inbound = adapt_whatsapp_payload(_payload_imagen(), uuid4())
+
+    assert inbound.media is not None
+    assert inbound.media.caption == ""
+    assert inbound.text == IMAGE_PLACEHOLDER
+
+
+def test_imagen_sin_id_de_media_falla_claro() -> None:
+    payload = _payload_texto(tipo="image")
+    payload["entry"][0]["changes"][0]["value"]["messages"][0]["image"] = {}
+
+    with pytest.raises(WhatsAppError):
+        adapt_whatsapp_payload(payload, uuid4())
+
+
+def test_check_image_acepta_formatos_de_whatsapp() -> None:
+    check_image(b"\xff\xd8datos", "image/jpeg")  # no lanza
+
+
+@pytest.mark.parametrize(
+    ("datos", "mime"),
+    [
+        (b"datos", "image/gif"),
+        (b"datos", "application/pdf"),
+        (b"", "image/png"),
+        (b"x" * (MAX_IMAGE_BYTES + 1), "image/png"),
+    ],
+    ids=["gif", "pdf", "vacia", "demasiado-grande"],
+)
+def test_check_image_rechaza_lo_que_whatsapp_no_acepta(datos: bytes, mime: str) -> None:
+    with pytest.raises(InvalidMedia):
+        check_image(datos, mime)
+
+
+async def test_descarga_de_media_en_dos_pasos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Primero se resuelve la URL temporal y despues se baja con el mismo token."""
+    pedidos: list[str] = []
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        pedidos.append(url)
+        assert kwargs["headers"]["Authorization"].startswith("Bearer ")
+        if url.endswith("/MEDIA123"):
+            return httpx.Response(
+                200,
+                json={"url": "https://lookaside.test/archivo", "mime_type": "image/jpeg",
+                      "file_size": 4},
+                request=httpx.Request("GET", url),
+            )
+        return httpx.Response(200, content=b"\xff\xd8ok", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    datos, mime = await download_whatsapp_media("MEDIA123")
+
+    assert datos == b"\xff\xd8ok"
+    assert mime == "image/jpeg"
+    assert pedidos[1] == "https://lookaside.test/archivo"
+
+
+async def test_descarga_rechaza_imagen_demasiado_grande(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Si Meta declara un tamaño mayor al tope, ni se descarga."""
+    pedidos: list[str] = []
+
+    async def fake_get(self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        pedidos.append(url)
+        return httpx.Response(
+            200,
+            json={"url": "https://lookaside.test/x", "mime_type": "image/jpeg",
+                  "file_size": MAX_IMAGE_BYTES + 1},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+    with pytest.raises(InvalidMedia):
+        await download_whatsapp_media("MEDIA123")
+    assert len(pedidos) == 1
+
+
+async def test_envio_de_imagen_sube_y_envia_por_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    llamadas: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_post(self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        llamadas.append((url, kwargs))
+        if url.endswith("/media"):
+            return httpx.Response(200, json={"id": "SUBIDA1"}, request=httpx.Request("POST", url))
+        return httpx.Response(
+            200, json={"messages": [{"id": "wamid.IMG"}]}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    mensaje_id = await send_whatsapp_image(
+        "573001112233", b"\xff\xd8ok", "image/jpeg", caption="Este es el modelo 👜"
+    )
+
+    assert mensaje_id == "wamid.IMG"
+    url_subida, subida = llamadas[0]
+    assert url_subida.endswith("/media")
+    assert subida["data"]["type"] == "image/jpeg"
+    _, envio = llamadas[1]
+    assert envio["json"]["type"] == "image"
+    assert envio["json"]["image"] == {"id": "SUBIDA1", "caption": "Este es el modelo 👜"}
+
+
+async def test_envio_de_imagen_invalida_no_llama_a_meta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llamadas = 0
+
+    async def fake_post(self: Any, url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal llamadas
+        llamadas += 1
+        return httpx.Response(200, json={}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    with pytest.raises(InvalidMedia):
+        await send_whatsapp_image("573001112233", b"GIF89a", "image/gif")
+    assert llamadas == 0
 
 
 # ======================================================================

@@ -1,0 +1,9 @@
+# Lo que corre en Linux (servidor EC2 y contenedores) va SIEMPRE con fin de línea LF,
+# aunque el repo se clone en Windows con core.autocrlf=true. Un script con CRLF
+# falla en bash ("$'\r': command not found") y Terraform renderiza las plantillas
+# tal como están en disco.
+*.tftpl     text eol=lf
+*.sh        text eol=lf
+*.tf        text eol=lf
+Dockerfile  text eol=lf
+.dockerignore text eol=lf

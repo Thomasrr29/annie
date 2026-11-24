@@ -1,0 +1,8 @@
+# Copiar a terraform.tfvars (ignorado por git) y completar.
+
+owner_email        = "tu-correo@ejemplo.com"
+monthly_budget_usd = 20
+
+# Opcional: dominio propio apuntando a la IP elástica (registro A).
+# Vacío = <ip-con-guiones>.sslip.io
+# domain = "annie.tudominio.com"

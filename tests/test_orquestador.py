@@ -18,11 +18,20 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import text
 
+from app.core.channel_whatsapp import WhatsAppError
 from app.core.llm import AgentTurnResult, ClassifyResult, LLMError
 from app.core.orchestrator import handle_inbound_message
 from app.db.repositories import AgentRepo
 from app.db.session import set_tenant, system_session
-from app.schemas import InboundMessage, Intent, TurnUsage
+from app.schemas import (
+    IMAGE_PLACEHOLDER,
+    ContentType,
+    InboundMedia,
+    InboundMessage,
+    Intent,
+    TurnUsage,
+    text_for_model,
+)
 from tests.conftest import requires_db
 
 pytestmark = [requires_db]
@@ -51,6 +60,8 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     async def fake_classify(message: str, ctx: Any, agents: list[Any]) -> ClassifyResult:
         estado["classify_calls"] += 1
+        estado["ctx_al_clasificador"] = ctx
+        estado["mensaje_al_clasificador"] = message
         if estado["raise_llm_error"]:
             raise LLMError("fallo simulado del modelo")
         agent_id = estado["agent_id"]
@@ -63,10 +74,20 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         )
 
     async def fake_run_agent_turn(**kwargs: Any) -> AgentTurnResult:
+        estado["mensaje_al_modelo"] = kwargs.get("message")
+        estado["ctx_al_modelo"] = kwargs.get("ctx")
+        estado["ejecutor"] = kwargs.get("tool_executor")
+        estado.setdefault("llamadas_turno", []).append(
+            {"message": kwargs.get("message"), "tools": kwargs.get("tools")}
+        )
         if estado["raise_llm_error"]:
             raise LLMError("fallo simulado del modelo")
+        # "reply" puede ser una lista: una respuesta por llamada (guardia de precios).
+        respuesta = estado["reply"]
+        if isinstance(respuesta, list):
+            respuesta = respuesta.pop(0)
         return AgentTurnResult(
-            reply_text=estado["reply"],
+            reply_text=respuesta,
             tools_used=list(estado["tools_used"]),
             usage=TurnUsage(
                 model_calls=1,
@@ -438,3 +459,409 @@ async def test_el_turno_no_toca_datos_de_otro_negocio(
         "SELECT id FROM messages WHERE business_id = :b",
     )
     assert ajenos == [], "el turno escribió en otro tenant"
+
+
+# ======================================================================
+# Imagenes del cliente (bandeja)
+# ======================================================================
+def _mensaje_con_imagen(business_id: UUID, pie: str = "") -> InboundMessage:
+    return InboundMessage(
+        business_id=business_id,
+        channel="whatsapp",
+        channel_identifier="573001112233",
+        text=text_for_model(ContentType.IMAGE, pie),
+        external_message_id=f"wamid.{uuid4()}",
+        received_at=datetime.now(UTC),
+        media=InboundMedia(
+            content_type=ContentType.IMAGE,
+            external_media_id="MEDIA123",
+            mime_type="image/jpeg",
+            caption=pie,
+        ),
+    )
+
+
+async def test_la_foto_del_cliente_se_guarda_con_su_archivo(
+    negocio: UUID, mock_llm: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_download(media_id: str) -> tuple[bytes, str]:
+        assert media_id == "MEDIA123"
+        return b"\xff\xd8foto", "image/jpeg"
+
+    monkeypatch.setattr("app.core.orchestrator.download_whatsapp_media", fake_download)
+
+    await handle_inbound_message(_mensaje_con_imagen(negocio, "¿tienen este?"))
+
+    mensajes = await _consultar(
+        negocio,
+        "SELECT id, role, content, content_type FROM messages "
+        "WHERE business_id = :b ORDER BY seq",
+    )
+    assert mensajes[0].role == "customer"
+    assert mensajes[0].content_type == "image"
+    # Se guarda el pie tal cual; el marcador es solo para el modelo.
+    assert mensajes[0].content == "¿tienen este?"
+
+    media = await _consultar(
+        negocio,
+        "SELECT message_id, mime_type, size_bytes FROM message_media WHERE business_id = :b",
+    )
+    assert len(media) == 1
+    assert media[0].message_id == mensajes[0].id
+    assert media[0].size_bytes == len(b"\xff\xd8foto")
+
+
+async def test_el_modelo_ve_un_marcador_y_no_la_foto(
+    negocio: UUID, mock_llm: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_download(media_id: str) -> tuple[bytes, str]:
+        return b"\xff\xd8foto", "image/jpeg"
+
+    monkeypatch.setattr("app.core.orchestrator.download_whatsapp_media", fake_download)
+
+    await handle_inbound_message(_mensaje_con_imagen(negocio, "este modelo"))
+
+    assert mock_llm["mensaje_al_modelo"] == f"{IMAGE_PLACEHOLDER} este modelo"
+    # El mensaje nuevo va UNA sola vez: como `message`, no también en el historial.
+    assert mock_llm["ctx_al_modelo"].recent_turns == []
+
+
+async def test_el_mensaje_nuevo_no_se_duplica_en_el_prompt(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """
+    Regresión (estudio/experimento_tinte.md): el historial se leía después de
+    guardar el mensaje entrante y build_messages lo volvía a agregar, así que el
+    modelo recibía la pregunta dos veces. Con eso confundía precios.
+    """
+    from app.core.llm import build_messages
+
+    mock_llm["intent"] = Intent.INFORM
+    await handle_inbound_message(_mensaje(negocio, "primera pregunta", "573005550001"))
+    await handle_inbound_message(_mensaje(negocio, "¿cuánto vale el tinte?", "573005550001"))
+
+    ctx = mock_llm["ctx_al_modelo"]
+    # El historial trae el turno anterior completo, no el mensaje nuevo.
+    assert [t.content for t in ctx.recent_turns][0] == "primera pregunta"
+    assert all(t.content != "¿cuánto vale el tinte?" for t in ctx.recent_turns)
+
+    prompt = build_messages(ctx, mock_llm["mensaje_al_modelo"])
+    texto_total = " ".join(m["content"] for m in prompt)
+    assert texto_total.count("¿cuánto vale el tinte?") == 1
+    # Y el clasificador tampoco lo ve repetido en "Últimos turnos".
+    assert all(
+        t.content != "¿cuánto vale el tinte?" for t in mock_llm["ctx_al_clasificador"].recent_turns
+    )
+
+
+async def test_si_falla_la_descarga_el_mensaje_se_guarda_igual(
+    negocio: UUID, mock_llm: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Perder la foto es mejor que perder el mensaje: el turno sigue."""
+
+    async def fake_download(media_id: str) -> tuple[bytes, str]:
+        raise WhatsAppError("la URL expiró")
+
+    monkeypatch.setattr("app.core.orchestrator.download_whatsapp_media", fake_download)
+
+    await handle_inbound_message(_mensaje_con_imagen(negocio))
+
+    mensajes = await _consultar(
+        negocio, "SELECT content_type FROM messages WHERE business_id = :b ORDER BY seq"
+    )
+    assert mensajes[0].content_type == "image"
+    assert await _consultar(negocio, "SELECT id FROM message_media WHERE business_id = :b") == []
+    assert mock_llm["enviados"], "el cliente debe recibir respuesta igual"
+
+
+# ======================================================================
+# Aislamiento entre clientes del MISMO negocio
+# ======================================================================
+def _textos(ctx: Any, mensaje: str = "") -> str:
+    """Todo lo que el modelo ve: el historial y el mensaje nuevo, en un solo string."""
+    return "\n".join([t.content for t in ctx.recent_turns] + [mensaje])
+
+
+async def test_el_agente_no_ve_el_historial_de_otro_cliente(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """
+    Lo que le dijo Ana no puede aparecer en el contexto con el que se le
+    responde a Bruno: ni en el clasificador ni en el agente.
+    """
+    await handle_inbound_message(
+        _mensaje(negocio, "mi cédula es 1012345678, dato-secreto-de-ana", telefono="573001110001")
+    )
+    await handle_inbound_message(_mensaje(negocio, "hola, ¿qué horarios tienen?", "573001110002"))
+
+    for ctx_clave, msg_clave in (
+        ("ctx_al_clasificador", "mensaje_al_clasificador"),
+        ("ctx_al_modelo", "mensaje_al_modelo"),
+    ):
+        visto = _textos(mock_llm[ctx_clave], mock_llm[msg_clave])
+        assert "dato-secreto-de-ana" not in visto, f"{ctx_clave} vio el historial de Ana"
+        assert "qué horarios tienen" in visto
+
+    conversaciones = await _consultar(
+        negocio, "SELECT DISTINCT conversation_id FROM messages WHERE business_id = :b"
+    )
+    assert len(conversaciones) == 2, "cada cliente debe tener su propia conversación"
+
+
+async def test_cada_cliente_retoma_solo_su_propia_conversacion(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Mensajes intercalados de dos clientes no se mezclan al volver a escribir."""
+    await handle_inbound_message(_mensaje(negocio, "ana-1", "573001110001"))
+    await handle_inbound_message(_mensaje(negocio, "bruno-1", "573001110002"))
+    await handle_inbound_message(_mensaje(negocio, "ana-2", "573001110001"))
+
+    visto = _textos(mock_llm["ctx_al_modelo"], mock_llm["mensaje_al_modelo"])
+    assert "ana-1" in visto and "ana-2" in visto
+    assert "bruno-1" not in visto
+
+
+async def test_el_flujo_a_medias_de_un_cliente_no_pasa_a_otro(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Los datos parciales (F4/F5) viven en la conversación, no en el negocio."""
+    mock_llm["intent"] = Intent.CLARIFY
+    await handle_inbound_message(_mensaje(negocio, "quiero agendar", "573001110001"))
+
+    mock_llm["intent"] = Intent.GREET
+    await handle_inbound_message(_mensaje(negocio, "hola", "573001110002"))
+
+    assert mock_llm["ctx_al_modelo"].flow_state == {}, "Bruno heredó el flujo de Ana"
+
+
+async def test_una_solicitud_queda_a_nombre_de_quien_la_pidio(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """
+    El cliente y la conversación de la herramienta los pone el código desde el
+    turno en curso: aunque el modelo quisiera, no hay campo para elegir otro.
+    """
+    await handle_inbound_message(_mensaje(negocio, "ana-1", "573001110001"))
+    mock_llm["intent"] = Intent.ACT
+    await handle_inbound_message(_mensaje(negocio, "quiero un turno", "573001110002"))
+
+    await mock_llm["ejecutor"](
+        "capture_request",
+        {"request_type": "agenda", "structured_data": {"hora": "10:00"}, "customer_id": "x"},
+    )
+
+    filas = await _consultar(
+        negocio,
+        "SELECT cu.channel_identifier FROM captured_requests r "
+        "JOIN customers cu ON cu.id = r.customer_id WHERE r.business_id = :b",
+    )
+    assert [f.channel_identifier for f in filas] == ["573001110002"]
+
+
+async def test_el_mismo_numero_en_otro_negocio_no_trae_su_historial(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Un teléfono que escribe a dos negocios es un cliente distinto en cada uno."""
+    otro = uuid4()
+    async with system_session() as s:
+        await set_tenant(s, otro)
+        await s.execute(
+            text("INSERT INTO businesses (id, name) VALUES (:i, 'Otro')"), {"i": otro}
+        )
+
+    try:
+        mock_llm["intent"] = Intent.GREET
+        await handle_inbound_message(_mensaje(otro, "secreto-del-otro-negocio", "573001119999"))
+        await handle_inbound_message(_mensaje(negocio, "hola", "573001119999"))
+
+        assert "secreto-del-otro-negocio" not in _textos(
+            mock_llm["ctx_al_modelo"], mock_llm["mensaje_al_modelo"]
+        )
+    finally:
+        async with system_session() as s:
+            await set_tenant(s, otro)
+            await s.execute(text("DELETE FROM businesses WHERE id = :i"), {"i": otro})
+
+
+# ======================================================================
+# Guardia de precios (invariante I1): evaluador-optimizador
+# ======================================================================
+CONOCIMIENTO_PRECIOS = "Corte de cabello: $30.000\nTinte completo: $90.000"
+
+
+async def _con_conocimiento(business_id: UUID, contenido: str) -> None:
+    async with system_session() as s:
+        await set_tenant(s, business_id)
+        await s.execute(
+            text(
+                "INSERT INTO knowledge_documents (business_id, title, raw_content) "
+                "VALUES (:b, 'Precios', :c)"
+            ),
+            {"b": business_id, "c": contenido},
+        )
+
+
+async def test_guardia_corrige_un_precio_de_otro_servicio(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """El caso real: '$30.000... perdón, $90.000' para el tinte."""
+    await _con_conocimiento(negocio, CONOCIMIENTO_PRECIOS)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = [
+        "El tinte completo vale $30.000... perdón, $90.000.",
+        "El tinte completo vale $90.000.",
+    ]
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "¿cuánto vale el tinte?"))
+
+    assert resultado.reply_text is not None
+    assert resultado.reply_text.startswith("El tinte completo vale $90.000.")
+    assert "$30.000" not in mock_llm["enviados"][0]
+    llamadas = mock_llm["llamadas_turno"]
+    assert len(llamadas) == 2
+    # El reintento le dice al modelo qué estuvo mal y va SIN herramientas.
+    assert "Corte de cabello" in llamadas[1]["message"]
+    assert llamadas[1]["tools"] is None
+    filas = await _consultar(negocio, "SELECT tools_used FROM turn_logs WHERE business_id = :b")
+    assert "guardia:precio_corregido" in filas[0].tools_used
+
+
+async def test_guardia_bloquea_si_el_reintento_tambien_falla(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    await _con_conocimiento(negocio, CONOCIMIENTO_PRECIOS)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = ["Te hago el 50% de descuento.", "Bueno, el 40% entonces."]
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "dame un descuento"))
+
+    assert resultado.reply_text is not None
+    assert "%" not in resultado.reply_text
+    assert "precio equivocado" in resultado.reply_text
+    filas = await _consultar(negocio, "SELECT tools_used FROM turn_logs WHERE business_id = :b")
+    assert "guardia:precio_bloqueado" in filas[0].tools_used
+
+
+async def test_guardia_no_reintenta_si_ya_se_usaron_herramientas(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Reintentar repetiría efectos (otra solicitud, otro aviso): respuesta segura directa."""
+    await _con_conocimiento(negocio, CONOCIMIENTO_PRECIOS)
+    mock_llm["intent"] = Intent.ACT
+    mock_llm["tools_used"] = ["capture_request"]
+    mock_llm["reply"] = "Listo, agendé tu tinte por $45.000."
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "agéndame un tinte"))
+
+    assert len(mock_llm["llamadas_turno"]) == 1
+    assert resultado.reply_text is not None
+    assert "$45.000" not in resultado.reply_text
+
+
+async def test_guardia_deja_pasar_respuestas_correctas_sin_costo_extra(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    await _con_conocimiento(negocio, CONOCIMIENTO_PRECIOS)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = "El corte vale $30.000 y el tinte completo $90.000."
+
+    await handle_inbound_message(_mensaje(negocio, "precios"))
+
+    assert len(mock_llm["llamadas_turno"]) == 1
+    filas = await _consultar(negocio, "SELECT tools_used FROM turn_logs WHERE business_id = :b")
+    assert filas[0].tools_used == []
+
+
+# ======================================================================
+# Catálogo: precios por referencia (el modelo elige el ítem, el sistema pone el número)
+# ======================================================================
+async def _con_catalogo(business_id: UUID, items: list[tuple[str, int]]) -> None:
+    async with system_session() as s:
+        await set_tenant(s, business_id)
+        for nombre, precio in items:
+            await s.execute(
+                text(
+                    "INSERT INTO catalog_items (business_id, name, price) VALUES (:b, :n, :p)"
+                ),
+                {"b": business_id, "n": nombre, "p": precio},
+            )
+
+
+CATALOGO_PELUQUERIA = [("Corte de cabello", 30_000), ("Tinte completo", 90_000)]
+
+
+async def test_catalogo_el_sistema_pone_el_precio(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    await _con_catalogo(negocio, CATALOGO_PELUQUERIA)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = "El tinte completo vale {{precio:tinte-completo}}."
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "¿cuánto vale el tinte?"))
+
+    assert resultado.reply_text is not None
+    assert resultado.reply_text.startswith("El tinte completo vale $90.000.")
+    assert "{{" not in mock_llm["enviados"][0], "nunca sale una referencia sin reemplazar"
+    assert len(mock_llm["llamadas_turno"]) == 1
+    # Lo que se guarda en el historial es lo que vio el cliente.
+    salida = await _consultar(
+        negocio, "SELECT content FROM messages WHERE business_id = :b AND role = 'agent'"
+    )
+    assert salida[0].content == "El tinte completo vale $90.000."
+
+
+async def test_catalogo_un_precio_escrito_a_mano_se_corrige(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Aunque el número sea CORRECTO, escrito a mano no sale: no está garantizado."""
+    await _con_catalogo(negocio, CATALOGO_PELUQUERIA)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = [
+        "El tinte completo vale $90.000.",
+        "El tinte completo vale {{precio:tinte-completo}}.",
+    ]
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "¿cuánto vale el tinte?"))
+
+    assert resultado.reply_text is not None
+    assert resultado.reply_text.startswith("El tinte completo vale $90.000.")
+    llamadas = mock_llm["llamadas_turno"]
+    assert len(llamadas) == 2
+    assert "a mano" in llamadas[1]["message"]
+    filas = await _consultar(negocio, "SELECT tools_used FROM turn_logs WHERE business_id = :b")
+    assert "guardia:precio_corregido" in filas[0].tools_used
+
+
+async def test_catalogo_la_referencia_de_otro_item_se_corrige(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """El error del tinte, en versión catálogo: nombra el tinte y referencia el corte."""
+    await _con_catalogo(negocio, CATALOGO_PELUQUERIA)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = [
+        "El tinte completo vale {{precio:corte-de-cabello}}.",
+        "El tinte completo vale {{precio:tinte-completo}}.",
+    ]
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "¿cuánto vale el tinte?"))
+
+    assert resultado.reply_text is not None
+    assert resultado.reply_text.startswith("El tinte completo vale $90.000.")
+    assert "$30.000" not in mock_llm["enviados"][0]
+
+
+async def test_catalogo_una_referencia_inventada_nunca_sale(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    await _con_catalogo(negocio, CATALOGO_PELUQUERIA)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = [
+        "La keratina vale {{precio:keratina}}.",
+        "La keratina vale {{precio:keratina-premium}}.",
+    ]
+
+    resultado = await handle_inbound_message(_mensaje(negocio, "¿y la keratina?"))
+
+    assert resultado.reply_text is not None
+    assert "{{" not in resultado.reply_text
+    assert "precio equivocado" in resultado.reply_text

@@ -55,7 +55,13 @@ jobs:
         run: ruff check .
 
       - name: Tipos (mypy)
-        run: mypy app scripts
+        # El panel se chequea aparte con MYPYPATH: sus modulos se importan por
+        # nombre plano (Streamlit pone el directorio del script en sys.path).
+        # `panel/pages/` queda afuera: los nombres empiezan con digito para fijar
+        # el orden del menu y no son identificadores validos de modulo.
+        run: |
+          mypy app scripts
+          MYPYPATH=panel mypy panel/api_client.py panel/extraccion.py panel/sesion.py
 
       - name: Migraciones desde cero
         run: alembic upgrade head

@@ -1,0 +1,24 @@
+# Secretos: nunca dentro de la imagen. En AWS el .env se arma en el servidor desde SSM.
+.env
+.env.*
+!.env.example
+
+# Git, cachés y entornos
+.git
+.github
+.venv
+**/__pycache__
+**/*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+*.egg-info
+
+# Lo que no corre en producción
+tests
+docs
+plan
+estudio
+infra
+deploy
+.claude

@@ -24,11 +24,19 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Final
 from uuid import UUID
 
 from app.core import tools as tools_module
-from app.core.channel_whatsapp import WhatsAppError, send_whatsapp_reply
+from app.core.catalog import render_prices, verification_lines
+from app.core.channel_whatsapp import (
+    WhatsAppError,
+    download_whatsapp_media,
+    send_whatsapp_reply,
+)
+from app.core.guards import check_prices, hand_written_amounts
 from app.core.limits import (
     AVISO_PRIVACIDAD,
     RESPUESTA_LIMITE_DIARIO,
@@ -51,6 +59,7 @@ from app.db.repositories import (
     ConversationRepo,
     CustomerRepo,
     EscalationRepo,
+    MediaRepo,
     MemoryRepo,
     MessageRepo,
     TurnLogRepo,
@@ -89,17 +98,45 @@ RESPUESTA_ESCALADA = (
 )
 
 
+class TurnOutcomeKind(str, Enum):
+    """Cómo terminó el turno. El webhook lo ignora; el sandbox lo muestra."""
+
+    REPLIED = "respondido"
+    HUMAN_MODE = "modo_humano"  # el agente calla: la conversación es de una persona (F6)
+    RATE_LIMITED = "rate_limit"  # respuesta fija, sin modelo ni registro del turno
+    DAILY_LIMIT = "limite_diario"  # circuit breaker del negocio: escala sin modelo
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """
+    Resultado de procesar un mensaje entrante.
+
+    Existe para que quien observa el turno (el sandbox) no tenga que adivinarlo
+    leyendo "el último mensaje" de la conversación: si el agente calló, ese
+    último mensaje es el del propio cliente.
+    """
+
+    kind: TurnOutcomeKind
+    reply_text: str | None
+    message_in_id: UUID | None
+
+    @property
+    def replied(self) -> bool:
+        return self.reply_text is not None
+
+
 # ======================================================================
 # Entrada principal
 # ======================================================================
 async def handle_inbound_message(
     inbound: InboundMessage, phone_number_id: str | None = None
-) -> None:
+) -> TurnOutcome:
     """
     Procesa un mensaje entrante de punta a punta.
 
     La llama el webhook en segundo plano (el ACK ya se envio). Nunca deja al
-    cliente sin respuesta por un error interno.
+    cliente sin respuesta por un error interno. Devuelve cómo terminó el turno.
     """
     inicio = time.monotonic()
     business_id = inbound.business_id
@@ -108,14 +145,18 @@ async def handle_inbound_message(
     # ni llamadas al modelo (fase 7, proteccion de costo).
     if not check_rate_limit(business_id, inbound.channel_identifier):
         await _send_reply(inbound, RESPUESTA_RATE_LIMIT, phone_number_id)
-        return
+        return TurnOutcome(TurnOutcomeKind.RATE_LIMITED, RESPUESTA_RATE_LIMIT, None)
 
-    ctx, business, message_in_id = await _resolve_and_load(inbound)
+    # La URL de descarga de Meta expira en minutos: la imagen se baja ahora,
+    # antes de abrir la transaccion (no se retiene una conexion durante la red).
+    archivo = await _descargar_media(inbound)
+
+    ctx, business, message_in_id = await _resolve_and_load(inbound, archivo)
 
     # Paso 3: modo humano -> el agente calla (F6, RF-12).
     if ctx.status == ConversationStatus.HUMAN:
         logger.info("conversacion %s en modo humano; no se responde", ctx.conversation_id)
-        return
+        return TurnOutcome(TurnOutcomeKind.HUMAN_MODE, None, message_in_id)
 
     # Circuit breaker de costo por tenant: al superarlo se escala a humano en vez
     # de seguir gastando turnos.
@@ -131,7 +172,7 @@ async def handle_inbound_message(
             int((time.monotonic() - inicio) * 1000),
         )
         await _send_reply(inbound, RESPUESTA_LIMITE_DIARIO, phone_number_id)
-        return
+        return TurnOutcome(TurnOutcomeKind.DAILY_LIMIT, RESPUESTA_LIMITE_DIARIO, message_in_id)
 
     intent: Intent = Intent.FALLBACK
     agent: AgentConfig | None = None
@@ -179,17 +220,37 @@ async def handle_inbound_message(
         await marcar_aviso_enviado(business_id, ctx.customer_id)
 
     await _send_reply(inbound, texto, phone_number_id)
+    return TurnOutcome(TurnOutcomeKind.REPLIED, texto, message_in_id)
 
 
 # ======================================================================
 # Pasos 1-2: contexto
 # ======================================================================
+async def _descargar_media(inbound: InboundMessage) -> tuple[bytes, str] | None:
+    """
+    Baja el adjunto del mensaje, si tiene. Nunca lanza.
+
+    Si la descarga falla, el mensaje se guarda igual (como imagen sin archivo) y
+    el turno sigue: perder la foto es mejor que perder el mensaje del cliente.
+    """
+    if inbound.media is None or inbound.channel != "whatsapp":
+        return None
+    try:
+        return await download_whatsapp_media(inbound.media.external_media_id)
+    except WhatsAppError:
+        logger.warning(
+            "no se pudo descargar la imagen del mensaje %s", inbound.external_message_id
+        )
+        return None
+
+
 async def _resolve_and_load(
     inbound: InboundMessage,
+    archivo: tuple[bytes, str] | None = None,
 ) -> tuple[ConversationContext, BusinessConfig, UUID | None]:
     """
-    Upsert de cliente, conversacion activa, guardado del mensaje entrante y carga
-    del contexto (historial + memoria).
+    Upsert de cliente, conversacion activa, guardado del mensaje entrante (con
+    su imagen, si la hay) y carga del contexto (historial + memoria).
 
     Todo en una transaccion: si algo falla, no queda un cliente sin conversacion
     ni un mensaje colgado.
@@ -209,14 +270,39 @@ async def _resolve_and_load(
         )
 
         msg_repo = MessageRepo(session)
-        entrante = await msg_repo.append(
-            business_id, conversation.id, MessageRole.CUSTOMER, inbound.text
-        )
+
+        # El historial se lee ANTES de guardar el entrante: el mensaje nuevo le
+        # llega al modelo aparte (`message` en classify/run_agent_turn, y
+        # build_messages lo agrega al final). Leerlo después lo duplicaba en el
+        # prompt, y con eso el modelo confundía precios (estudio/experimento_tinte.md:
+        # 6 de 12 respuestas con el precio de otro servicio).
+        recent = await msg_repo.recent(business_id, conversation.id)
+
+        if inbound.media is not None:
+            # Se guarda el pie de foto; el marcador para el modelo lo agrega
+            # `recent()` al leer el historial.
+            entrante = await msg_repo.append(
+                business_id,
+                conversation.id,
+                MessageRole.CUSTOMER,
+                inbound.media.caption,
+                content_type=inbound.media.content_type,
+            )
+            if archivo is not None:
+                datos, mime_type = archivo
+                await MediaRepo(session).create(
+                    business_id,
+                    entrante.id,
+                    mime_type,
+                    datos,
+                    wa_media_id=inbound.media.external_media_id,
+                )
+        else:
+            entrante = await msg_repo.append(
+                business_id, conversation.id, MessageRole.CUSTOMER, inbound.text
+            )
         await conv_repo.touch_last_message(business_id, conversation.id, inbound.received_at)
 
-        # El historial se lee DESPUES de guardar el entrante, para que el modelo
-        # vea el turno completo.
-        recent = await msg_repo.recent(business_id, conversation.id)
         memoria = await MemoryRepo(session).get(business_id, customer.id)
         business = await BusinessRepo(session).get_config(business_id)
 
@@ -363,14 +449,136 @@ async def _run_handler(
 
     nuevo_flow_state = _calcular_flow_state(intent, ctx, resultado)
 
+    texto, usage, marcas = await _guardia_de_precios(
+        resultado, agent=agent, business=business, ctx=ctx, inbound=inbound
+    )
+
     return (
         HandlerResult(
-            reply_text=resultado.reply_text or RESPUESTA_ERROR,
-            tools_used=resultado.tools_used,
+            reply_text=texto,
+            tools_used=list(resultado.tools_used) + marcas,
             new_flow_state=nuevo_flow_state,
         ),
-        resultado.usage,
+        usage,
     )
+
+
+# ======================================================================
+# Guardia de precios (invariante I1) — patrón evaluador-optimizador
+# ======================================================================
+GUARDIA_CORREGIDA: Final = "guardia:precio_corregido"
+GUARDIA_BLOQUEADA: Final = "guardia:precio_bloqueado"
+
+RESPUESTA_PRECIO_SEGURA = (
+    "Perdoná, no quiero darte un precio equivocado. "
+    "¿Querés que una persona del negocio te lo confirme?"
+)
+
+
+async def _guardia_de_precios(
+    resultado: AgentTurnResult,
+    *,
+    agent: AgentConfig,
+    business: BusinessConfig,
+    ctx: ConversationContext,
+    inbound: InboundMessage,
+) -> tuple[str, TurnUsage, list[str]]:
+    """
+    Evalúa la respuesta contra I1 y, si falla, la corrige UNA vez.
+
+    1. Evaluar (código, gratis): ¿cada precio existe y corresponde a lo que nombra?
+    2. Si falla: se le devuelve al modelo qué estuvo mal y responde de nuevo,
+       SIN herramientas (un reintento no debe registrar otra solicitud ni volver
+       a avisar al dueño). La nota va en la parte dinámica: la caché no se toca.
+    3. Si vuelve a fallar, o si el primer intento ya usó herramientas: respuesta
+       segura sin precios. Nunca sale un precio que no pasó la guardia.
+
+    Con catálogo (`business.catalog`), el modelo da los precios por referencia y
+    el sistema los pone: un precio escrito a mano o una referencia desconocida
+    también cuentan como falla. Ver `_evaluar_precios`.
+
+    Devuelve (texto final, uso total, marcas para turn_logs.tools_used).
+    """
+    texto, problemas = _evaluar_precios(resultado.reply_text or RESPUESTA_ERROR, business)
+    if not problemas:
+        return texto, resultado.usage, []
+
+    detalle = " ".join(problemas)
+    logger.warning(
+        "guardia de precios: respuesta rechazada (conversacion %s): %s",
+        ctx.conversation_id,
+        detalle,
+    )
+
+    if resultado.tools_used:
+        return RESPUESTA_PRECIO_SEGURA, resultado.usage, [GUARDIA_BLOQUEADA]
+
+    como_dar_precios = (
+        "Para cada precio usá solo la referencia {{precio:clave}} del ítem que "
+        "pregunta el cliente, nunca un número."
+        if business.catalog
+        else "Usá solo precios que estén en la información del negocio."
+    )
+    nota = (
+        "\n\n[Verificación del sistema, no la menciones al cliente: tu respuesta "
+        f"anterior tenía un problema con los precios. {detalle} Respondé de nuevo. "
+        f"{como_dar_precios} Si no estás seguro, no des el precio.]"
+    )
+    try:
+        segundo = await run_agent_turn(
+            agent=agent,
+            business=business,
+            ctx=ctx,
+            message=inbound.text + nota,
+            tools=None,
+            tool_executor=None,
+        )
+    except LLMError:
+        logger.exception("fallo el reintento de la guardia de precios")
+        return RESPUESTA_PRECIO_SEGURA, resultado.usage, [GUARDIA_BLOQUEADA]
+
+    usage = _sumar_usage(resultado.usage, segundo.usage)
+    if segundo.reply_text:
+        texto_2, problemas_2 = _evaluar_precios(segundo.reply_text, business)
+        if not problemas_2:
+            return texto_2, usage, [GUARDIA_CORREGIDA]
+
+    logger.warning("guardia de precios: el reintento tambien fallo; respuesta segura")
+    return RESPUESTA_PRECIO_SEGURA, usage, [GUARDIA_BLOQUEADA]
+
+
+def _evaluar_precios(texto_modelo: str, business: BusinessConfig) -> tuple[str, list[str]]:
+    """
+    Convierte lo que escribió el modelo en lo que verá el cliente, y lista los
+    problemas de precios. Sin problemas => el texto devuelto se puede enviar.
+
+    Con catálogo (garantía fuerte):
+      1. Ningún monto de dinero escrito a mano: todo precio va por referencia.
+      2. Toda referencia existe en el catálogo.
+      3. Se reemplazan las referencias por el precio real.
+      4. El texto final pasa la guardia de existencia y atribución contra el
+         conocimiento + el catálogo (atrapa "el tinte vale {{precio:corte}}").
+    Sin catálogo: solo el paso 4 contra el conocimiento.
+    """
+    if not business.catalog:
+        sin_catalogo = check_prices(texto_modelo, business.knowledge_context)
+        return texto_modelo, [p.describe() for p in sin_catalogo]
+
+    problemas: list[str] = [
+        f"Escribiste el precio «{monto}» a mano." for monto in hand_written_amounts(texto_modelo)
+    ]
+    renderizado = render_prices(texto_modelo, business.catalog)
+    problemas += [
+        f"La referencia «{ref}» no existe en el catálogo." for ref in renderizado.unknown_refs
+    ]
+    if problemas:
+        return renderizado.text, problemas
+
+    fuente = "\n\n".join(
+        x for x in (business.knowledge_context, verification_lines(business.catalog)) if x
+    )
+    problemas += [p.describe() for p in check_prices(renderizado.text, fuente)]
+    return renderizado.text, problemas
 
 
 INSTRUCCIONES_GREET = (
@@ -582,4 +790,4 @@ def _sumar_usage(a: TurnUsage, b: TurnUsage) -> TurnUsage:
     )
 
 
-__all__ = ["handle_inbound_message"]
+__all__ = ["TurnOutcome", "TurnOutcomeKind", "handle_inbound_message"]

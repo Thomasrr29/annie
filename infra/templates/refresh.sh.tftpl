@@ -1,0 +1,40 @@
+#!/bin/bash
+# Generado por Terraform. Lo ejecuta deploy/deploy.ps1 vía SSM Run Command.
+# 1) arma el .env desde SSM  2) entra a ECR  3) baja las imágenes nuevas y reinicia.
+set -euo pipefail
+cd /opt/annie
+
+echo "==> .env desde SSM (${ssm_prefix}/*)"
+aws ssm get-parameters-by-path \
+  --region ${region} \
+  --path "${ssm_prefix}/" \
+  --recursive \
+  --with-decryption \
+  --query 'Parameters[*].[Name,Value]' \
+  --output text > /tmp/annie_params.tsv
+
+: > .env.tmp
+while IFS=$'\t' read -r name value; do
+  [ -n "$name" ] || continue
+  echo "$${name##*/}=$${value}" >> .env.tmp
+done < /tmp/annie_params.tsv
+install -m 600 .env.tmp .env
+rm -f .env.tmp /tmp/annie_params.tsv
+
+for requerido in ANTHROPIC_API_KEY WHATSAPP_PHONE_NUMBER_ID WHATSAPP_WABA_ID WHATSAPP_ACCESS_TOKEN WHATSAPP_APP_SECRET; do
+  if ! grep -q "^$${requerido}=" .env; then
+    echo "FALTA el parámetro ${ssm_prefix}/$${requerido} en SSM (ver infra/README.md)" >&2
+    exit 1
+  fi
+done
+
+echo "==> login en ECR"
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+
+echo "==> pull + up"
+docker compose pull
+docker compose up -d --remove-orphans
+docker image prune -f
+
+echo "==> estado"
+docker compose ps

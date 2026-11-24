@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    LargeBinary,
     Numeric,
     Text,
     UniqueConstraint,
@@ -182,6 +183,25 @@ class KnowledgeChunk(Base):
 
 
 # ============================================================
+# 5b. CATÁLOGO (migración 0012): lo que vende el negocio y su precio
+# ============================================================
+class CatalogItem(Base):
+    """El modelo nunca escribe estos precios: los referencia y el sistema los pone."""
+
+    __tablename__ = "catalog_items"
+    __table_args__ = (UniqueConstraint("business_id", "name"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    business_id: Mapped[uuid.UUID] = _business_fk()
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(Text, nullable=False, server_default="COP")
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+    created_at: Mapped[dt.datetime] = _created_at()
+    updated_at: Mapped[dt.datetime] = _updated_at()
+
+
+# ============================================================
 # 6. CLIENTES (identidad por canal, RF-03)
 # ============================================================
 class Customer(Base):
@@ -243,6 +263,8 @@ class Conversation(Base):
     created_at: Mapped[dt.datetime] = _created_at()
     last_message_at: Mapped[dt.datetime | None] = _optional_timestamp()
     updated_at: Mapped[dt.datetime] = _updated_at()
+    # Hasta donde leyo el negocio en la bandeja (migracion 0011).
+    owner_last_read_at: Mapped[dt.datetime | None] = _optional_timestamp()
 
 
 # ============================================================
@@ -266,7 +288,31 @@ class Message(Base):
     )
     business_id: Mapped[uuid.UUID] = _business_fk()
     role: Mapped[str] = mapped_column(Text, nullable=False)
+    # Para una imagen, `content` es el pie de foto (puede ser vacio) y el archivo
+    # vive en `message_media` (migracion 0011).
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(Text, nullable=False, server_default="text")
+    created_at: Mapped[dt.datetime] = _created_at()
+
+
+class MessageMedia(Base):
+    """Archivo de un mensaje (1:1). Se borra en cascada con el mensaje."""
+
+    __tablename__ = "message_media"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    business_id: Mapped[uuid.UUID] = _business_fk()
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    mime_type: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Id de Meta: solo diagnostico, expira a los pocos dias.
+    wa_media_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = _created_at()
 
 
@@ -450,6 +496,7 @@ __all__ = [
     "Base",
     "Business",
     "CapturedRequest",
+    "CatalogItem",
     "Conversation",
     "Customer",
     "CustomerMemory",
@@ -459,5 +506,6 @@ __all__ = [
     "KnowledgeChunk",
     "KnowledgeDocument",
     "Message",
+    "MessageMedia",
     "TurnLog",
 ]

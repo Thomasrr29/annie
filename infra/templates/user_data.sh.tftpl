@@ -1,0 +1,34 @@
+#!/bin/bash
+# Arranque del servidor (corre una sola vez, la primera vez que se crea la EC2).
+# Instala Docker y deja listos los archivos en /opt/annie. La app la levanta
+# refresh.sh cuando ya existen las imágenes en ECR y los secretos en SSM.
+set -euxo pipefail
+
+dnf update -y
+dnf install -y docker
+systemctl enable --now docker
+
+# Plugin de Docker Compose (versión fija, no "latest").
+COMPOSE_VERSION="v2.29.7"
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-x86_64" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+mkdir -p /opt/annie
+
+cat > /opt/annie/docker-compose.yml <<'ANNIE_COMPOSE'
+${compose}
+ANNIE_COMPOSE
+
+cat > /opt/annie/Caddyfile <<'ANNIE_CADDY'
+${caddyfile}
+ANNIE_CADDY
+
+cat > /opt/annie/refresh.sh <<'ANNIE_REFRESH'
+${refresh}
+ANNIE_REFRESH
+chmod 750 /opt/annie/refresh.sh
+
+# Si ya hay imágenes y secretos (por ejemplo, al recrear el servidor), arranca solo.
+/opt/annie/refresh.sh || echo "annie: todavía faltan imágenes o secretos; correr deploy/deploy.ps1"

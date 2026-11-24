@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.repositories import (
@@ -368,6 +369,30 @@ async def test_knowledge_context_es_deterministico(
 
     assert primero is not None
     assert primero == segundo
+
+
+async def test_knowledge_context_empate_de_carga_se_ordena_por_titulo(
+    session: AsyncSession, business_a: UUID
+) -> None:
+    """
+    Documentos creados en la misma transacción comparten created_at. El orden no
+    puede depender del UUID (aleatorio): se ordena por título, y así cualquier
+    negocio con el mismo conocimiento recibe el mismo prompt.
+    """
+    for titulo in ("Zeta", "Alfa", "Media"):
+        await session.execute(
+            text(
+                "INSERT INTO knowledge_documents (business_id, title, raw_content) "
+                "VALUES (:bid, :t, :c)"
+            ),
+            {"bid": business_a, "t": titulo, "c": f"contenido {titulo}"},
+        )
+    await session.flush()
+
+    contexto = await BusinessRepo(session).build_knowledge_context(business_a)
+
+    assert contexto is not None
+    assert contexto.index("## Alfa") < contexto.index("## Media") < contexto.index("## Zeta")
 
 
 async def test_knowledge_context_concatena_todos_los_documentos(

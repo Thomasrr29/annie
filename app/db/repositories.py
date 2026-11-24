@@ -16,7 +16,7 @@ import datetime as dt
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Select, select, text, update
+from sqlalchemy import Select, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,7 @@ from app.db.models import (
     Agent,
     Business,
     CapturedRequest,
+    CatalogItem,
     Conversation,
     Customer,
     CustomerMemory,
@@ -31,14 +32,18 @@ from app.db.models import (
     InboundEvent,
     KnowledgeDocument,
     Message,
+    MessageMedia,
     TurnLog,
 )
 from app.schemas import (
     AgentConfig,
     BusinessConfig,
+    CatalogEntry,
+    ContentType,
     ConversationStatus,
     ConversationTurn,
     MessageRole,
+    text_for_model,
 )
 from app.schemas import CustomerMemory as CustomerMemorySchema
 
@@ -189,6 +194,89 @@ class ConversationRepo(TenantScopedRepo):
             .values(last_message_at=when or dt.datetime.now(dt.UTC))
         )
 
+    async def mark_read(self, business_id: UUID, conversation_id: UUID) -> None:
+        """La bandeja abrio la conversacion: lo anterior deja de ser 'no leido'."""
+        await self.session.execute(
+            update(Conversation)
+            .where(Conversation.id == conversation_id, Conversation.business_id == business_id)
+            .values(owner_last_read_at=dt.datetime.now(dt.UTC))
+        )
+
+    async def list_inbox(
+        self,
+        business_id: UUID,
+        status: ConversationStatus | None = None,
+        search: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """
+        Bandeja: conversaciones por actividad reciente, con lo que la lista
+        necesita para pintarse en una sola consulta (cliente, ultimo mensaje, no
+        leidos, escalamiento abierto y ultimo mensaje del cliente para la
+        ventana de 24h).
+
+        Corre cada pocos segundos con el panel abierto: por eso es una consulta y
+        no N+1. Cada subconsulta repite el filtro de tenant (capa 1); RLS respalda.
+        """
+        filtros = ["c.business_id = :b"]
+        params: dict[str, Any] = {"b": business_id, "l": limit}
+        if status is not None:
+            filtros.append("c.status = :s")
+            params["s"] = status.value
+        if search and search.strip():
+            filtros.append("(cu.display_name ILIKE :q OR cu.channel_identifier ILIKE :q)")
+            params["q"] = f"%{search.strip()}%"
+
+        sql = f"""
+            SELECT c.id, c.status, c.channel, c.last_message_at, c.created_at,
+                   cu.id AS customer_id, cu.display_name, cu.channel_identifier,
+                   lm.role AS last_role, lm.content AS last_content,
+                   lm.content_type AS last_content_type,
+                   (SELECT count(*) FROM messages m
+                     WHERE m.conversation_id = c.id AND m.business_id = :b
+                       AND m.role = 'customer'
+                       AND m.created_at > coalesce(c.owner_last_read_at, '-infinity'))
+                     AS unread,
+                   (SELECT max(m.created_at) FROM messages m
+                     WHERE m.conversation_id = c.id AND m.business_id = :b
+                       AND m.role = 'customer')
+                     AS last_customer_message_at,
+                   esc.id AS open_escalation_id, esc.reason AS open_escalation_reason
+            FROM conversations c
+            JOIN customers cu ON cu.id = c.customer_id AND cu.business_id = :b
+            LEFT JOIN LATERAL (
+                SELECT m.role, m.content, m.content_type FROM messages m
+                WHERE m.conversation_id = c.id AND m.business_id = :b
+                ORDER BY m.seq DESC LIMIT 1
+            ) lm ON true
+            LEFT JOIN LATERAL (
+                SELECT e.id, e.reason FROM escalations e
+                WHERE e.conversation_id = c.id AND e.business_id = :b AND e.status = 'open'
+                ORDER BY e.created_at DESC LIMIT 1
+            ) esc ON true
+            WHERE {" AND ".join(filtros)}
+            ORDER BY c.last_message_at DESC NULLS LAST, c.created_at DESC
+            LIMIT :l
+        """
+        # El f-string solo junta filtros literales de arriba; los valores del
+        # usuario (estado, busqueda) viajan siempre como parametros.
+        filas = (await self.session.execute(text(sql), params)).mappings().all()
+        return [dict(f) for f in filas]
+
+    async def last_customer_message_at(
+        self, business_id: UUID, conversation_id: UUID
+    ) -> dt.datetime | None:
+        """Ultimo mensaje del cliente: abre la ventana de 24h de WhatsApp."""
+        stmt = (
+            select(func.max(Message.created_at))
+            .where(
+                Message.business_id == business_id,
+                Message.conversation_id == conversation_id,
+                Message.role == MessageRole.CUSTOMER.value,
+            )
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
 
 # ======================================================================
 # Mensajes (historial; NUNCA alimenta el RAG)
@@ -200,17 +288,69 @@ class MessageRepo(TenantScopedRepo):
         conversation_id: UUID,
         role: MessageRole,
         content: str,
+        content_type: ContentType = ContentType.TEXT,
     ) -> Message:
-        """RF-16. Persiste un turno del historial."""
+        """
+        RF-16. Persiste un turno del historial.
+
+        Para una imagen, `content` es el pie de foto y el archivo se guarda
+        aparte con `MediaRepo.create`.
+        """
         message = Message(
             business_id=business_id,
             conversation_id=conversation_id,
             role=role.value,
             content=content,
+            content_type=content_type.value,
         )
         self.session.add(message)
         await self.session.flush()
         return message
+
+    async def list_for_inbox(
+        self,
+        business_id: UUID,
+        conversation_id: UUID,
+        after_seq: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Historial para la bandeja, con la referencia al archivo si lo hay.
+
+        Sin `after_seq` devuelve los ultimos `limit`; con `after_seq` solo los
+        posteriores, que es lo que pide el panel en cada refresco.
+        """
+        stmt = (
+            self._scoped(
+                select(Message, MessageMedia.id, MessageMedia.mime_type), Message, business_id
+            )
+            .outerjoin(
+                MessageMedia,
+                (MessageMedia.message_id == Message.id)
+                & (MessageMedia.business_id == business_id),
+            )
+            .where(Message.conversation_id == conversation_id)
+        )
+        if after_seq is not None:
+            stmt = stmt.where(Message.seq > after_seq).order_by(Message.seq).limit(limit)
+            filas = list((await self.session.execute(stmt)).all())
+        else:
+            stmt = stmt.order_by(Message.seq.desc()).limit(limit)
+            filas = list(reversed((await self.session.execute(stmt)).all()))
+
+        return [
+            {
+                "id": m.id,
+                "seq": m.seq,
+                "role": m.role,
+                "content_type": m.content_type,
+                "content": m.content,
+                "created_at": m.created_at,
+                "media_id": media_id,
+                "media_mime_type": mime,
+            }
+            for m, media_id, mime in filas
+        ]
 
     async def recent(
         self,
@@ -235,12 +375,47 @@ class MessageRepo(TenantScopedRepo):
             .limit(limit)
         )
         rows = (await self.session.execute(stmt)).scalars().all()
+        # Las imagenes llegan al modelo como marcador + pie: el MVP no le pasa
+        # imagenes al LLM, pero el agente tiene que saber que hubo una foto.
         return [
             ConversationTurn(
-                role=MessageRole(m.role), content=m.content, created_at=m.created_at
+                role=MessageRole(m.role),
+                content=text_for_model(m.content_type, m.content),
+                created_at=m.created_at,
             )
             for m in reversed(rows)
         ]
+
+
+# ======================================================================
+# Archivos de los mensajes (bandeja)
+# ======================================================================
+class MediaRepo(TenantScopedRepo):
+    async def create(
+        self,
+        business_id: UUID,
+        message_id: UUID,
+        mime_type: str,
+        data: bytes,
+        wa_media_id: str | None = None,
+    ) -> MessageMedia:
+        media = MessageMedia(
+            business_id=business_id,
+            message_id=message_id,
+            mime_type=mime_type,
+            size_bytes=len(data),
+            data=data,
+            wa_media_id=wa_media_id,
+        )
+        self.session.add(media)
+        await self.session.flush()
+        return media
+
+    async def get(self, business_id: UUID, media_id: UUID) -> MessageMedia | None:
+        stmt = self._scoped(select(MessageMedia), MessageMedia, business_id).where(
+            MessageMedia.id == media_id
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
 
 
 # ======================================================================
@@ -365,6 +540,7 @@ class BusinessRepo(TenantScopedRepo):
 
         config = BusinessConfig.model_validate(business)
         config.knowledge_context = await self.build_knowledge_context(business_id)
+        config.catalog = await CatalogRepo(self.session).list_active(business_id)
         return config
 
     async def build_knowledge_context(self, business_id: UUID) -> str | None:
@@ -374,9 +550,16 @@ class BusinessRepo(TenantScopedRepo):
         Devuelve None si no hay conocimiento, para no meter una seccion vacia en
         el prefijo del prompt.
         """
+        # Orden: de carga y, en empate, por título. NUNCA por id solo: el id es
+        # un UUID aleatorio, y los documentos creados en la misma transacción
+        # comparten created_at (now() es constante), así que el orden quedaba al
+        # azar. El orden cambia lo que responde el modelo
+        # (estudio/experimento_tinte.md); tiene que ser predecible y controlable.
         stmt = (
             self._scoped(select(KnowledgeDocument), KnowledgeDocument, business_id)
-            .order_by(KnowledgeDocument.created_at, KnowledgeDocument.id)
+            .order_by(
+                KnowledgeDocument.created_at, KnowledgeDocument.title, KnowledgeDocument.id
+            )
         )
         docs = (await self.session.execute(stmt)).scalars().all()
 
@@ -412,13 +595,72 @@ class BusinessRepo(TenantScopedRepo):
 
     async def get_notify_config(self, business_id: UUID) -> dict[str, Any]:
         """R para la herramienta notify_owner (RF-11)."""
-        stmt = select(Business.notify_channel, Business.notify_config).where(
+        stmt = select(Business.name, Business.notify_channel, Business.notify_config).where(
             Business.id == business_id
         )
         row = (await self.session.execute(stmt)).one_or_none()
         if row is None:
             return {}
-        return {"channel": row.notify_channel, "config": row.notify_config}
+        return {"name": row.name, "channel": row.notify_channel, "config": row.notify_config}
+
+
+# ======================================================================
+# Catálogo (migración 0012): lo que vende el negocio y su precio
+# ======================================================================
+class CatalogRepo(TenantScopedRepo):
+    async def list_active(self, business_id: UUID) -> list[CatalogEntry]:
+        """
+        Ítems activos en orden estable (por nombre): la lista va al prefijo
+        cacheado del prompt, así que el mismo catálogo debe dar el mismo texto.
+        """
+        stmt = (
+            self._scoped(select(CatalogItem), CatalogItem, business_id)
+            .where(CatalogItem.status == "active")
+            .order_by(CatalogItem.name, CatalogItem.id)
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [CatalogEntry.model_validate(r) for r in rows]
+
+    async def list_all(self, business_id: UUID) -> list[CatalogItem]:
+        stmt = self._scoped(select(CatalogItem), CatalogItem, business_id).order_by(
+            CatalogItem.name, CatalogItem.id
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def get(self, business_id: UUID, item_id: UUID) -> CatalogItem | None:
+        stmt = self._scoped(select(CatalogItem), CatalogItem, business_id).where(
+            CatalogItem.id == item_id
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def create(
+        self, business_id: UUID, name: str, price: int, currency: str = "COP"
+    ) -> CatalogItem:
+        item = CatalogItem(business_id=business_id, name=name, price=price, currency=currency)
+        self.session.add(item)
+        await self.session.flush()
+        return item
+
+    async def update(
+        self, business_id: UUID, item_id: UUID, changes: dict[str, Any]
+    ) -> CatalogItem | None:
+        item = await self.get(business_id, item_id)
+        if item is None:
+            return None
+        for campo in ("name", "price", "currency", "status"):
+            if campo in changes and changes[campo] is not None:
+                setattr(item, campo, changes[campo])
+        item.updated_at = dt.datetime.now(dt.UTC)
+        await self.session.flush()
+        return item
+
+    async def delete(self, business_id: UUID, item_id: UUID) -> bool:
+        item = await self.get(business_id, item_id)
+        if item is None:
+            return False
+        await self.session.delete(item)
+        await self.session.flush()
+        return True
 
 
 # ======================================================================
@@ -498,6 +740,32 @@ class EscalationRepo(TenantScopedRepo):
                 resolved_at=dt.datetime.now(dt.UTC),
                 resolved_by=resolved_by,
             )
+        )
+
+    async def open_for_conversation(
+        self, business_id: UUID, conversation_id: UUID
+    ) -> Escalation | None:
+        """El escalamiento abierto mas reciente de la conversacion, si hay."""
+        stmt = (
+            self._scoped(select(Escalation), Escalation, business_id)
+            .where(Escalation.conversation_id == conversation_id, Escalation.status == "open")
+            .order_by(Escalation.created_at.desc())
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def resolve_open_for_conversation(
+        self, business_id: UUID, conversation_id: UUID
+    ) -> None:
+        """Devolver la conversacion al agente cierra lo que estaba abierto."""
+        await self.session.execute(
+            update(Escalation)
+            .where(
+                Escalation.business_id == business_id,
+                Escalation.conversation_id == conversation_id,
+                Escalation.status == "open",
+            )
+            .values(status="resolved", resolved_at=dt.datetime.now(dt.UTC))
         )
 
     async def list_open(self, business_id: UUID, limit: int = 50) -> list[Escalation]:
@@ -621,10 +889,12 @@ __all__ = [
     "DEFAULT_RECENT_TURNS",
     "AgentRepo",
     "BusinessRepo",
+    "CatalogRepo",
     "ConversationRepo",
     "CustomerRepo",
     "EscalationRepo",
     "InboundEventRepo",
+    "MediaRepo",
     "MemoryRepo",
     "MessageRepo",
     "RequestRepo",

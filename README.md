@@ -50,6 +50,39 @@ curl -X POST localhost:8000/admin/sandbox/message \
 El sandbox corre el **mismo** orquestador con un canal falso y devuelve además la
 intención detectada, el agente enrutado, las herramientas usadas y el costo.
 
+### Panel de administración (Streamlit)
+
+```bash
+.venv/bin/pip install -e ".[panel]"
+.venv/bin/streamlit run panel/app.py        # http://localhost:8501
+```
+
+Pegar el token del paso 6 en la barra lateral. El panel es un **cliente HTTP de
+`/admin/*`**: no importa `app.*` ni toca la base, así que el aislamiento sigue
+siendo el de la API (token → `business_id` → RLS), sin una segunda puerta a los
+datos.
+
+| Página | Para qué |
+|--------|----------|
+| Conversaciones | Bandeja: lista, historial completo con fotos, responder con texto/emojis/imágenes, tomar o devolver al agente, ventana de 24 h |
+| Conocimiento | Cargar/revisar/borrar lo que el agente sabe (`.txt`, `.md`, `.pdf`, `.docx` o pegado) |
+| Sandbox | Conversar con el agente sin WhatsApp, con la traza del turno |
+| Agentes | Alta y edición: enrutamiento, instrucciones, herramientas |
+| Bandejas | Solicitudes capturadas y escalamientos (llevan a Conversaciones para responder) |
+| Métricas | Volumen, % sin humano, costo y salud de la caché |
+| Negocio | Datos, notificaciones y borrado de datos (Ley 1581) |
+
+Es la herramienta del **piloto**: Streamlit no tiene sesiones reales ni
+multiusuario. Un panel público multi-tenant necesita otra cosa.
+
+Dos cosas que la página de conocimiento hace a propósito:
+
+- **El texto extraído siempre se muestra editable antes de guardar.** Un PDF con
+  tablas o columnas produce texto desordenado, y ese desorden llega tal cual al
+  cliente porque el agente puede citarlo textualmente.
+- **`confirmed_public` no viene marcado.** Es el único control entre un documento
+  interno y un cliente leyéndolo por WhatsApp.
+
 ### Conectar WhatsApp
 
 1. En Meta for Developers, apuntar el webhook a `https://<host>/webhooks/whatsapp`
@@ -79,6 +112,7 @@ Meta Cloud API → POST /webhooks/whatsapp → [firma → tenant → dedup] → 
 | `app/core/channel_whatsapp.py` | Única pieza que conoce el formato de WhatsApp |
 | `app/core/limits.py` | Rate limit, tope diario de costo, privacidad (Ley 1581) |
 | `app/db/repositories.py` | Único acceso a datos, siempre filtrado por `business_id` |
+| `panel/` | Panel Streamlit: cliente HTTP de `/admin/*`, proceso aparte |
 
 ## Roles de base de datos (importante)
 
@@ -114,9 +148,14 @@ Todo lo demás sigue protegido.
 ## Desarrollo
 
 ```bash
-.venv/bin/ruff check .        # lint
+.venv/bin/ruff check .        # lint (incluye panel/)
 .venv/bin/mypy app scripts    # tipos
-.venv/bin/pytest -q           # tests (219)
+.venv/bin/pytest -q           # tests
+
+# El panel se chequea aparte: sus módulos se importan por nombre plano porque
+# Streamlit pone el directorio del script en sys.path. `panel/pages/` queda
+# afuera (los nombres empiezan con dígito para fijar el orden del menú).
+MYPYPATH=panel .venv/bin/mypy panel/api_client.py panel/extraccion.py panel/sesion.py
 ```
 
 Los tests que necesitan Postgres se saltan si no hay `DATABASE_URL`, para no

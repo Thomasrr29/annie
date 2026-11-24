@@ -18,11 +18,11 @@ class Settings(BaseSettings):
     # --- Anthropic API ---
     anthropic_api_key: str = Field(..., description="API key de Anthropic")
     anthropic_model_classify: str = Field(
-        default="claude-3-5-haiku-20241022",
+        default="claude-haiku-4-5",
         description="Modelo Haiku para clasificación de intención",
     )
     anthropic_model_respond: str = Field(
-        default="claude-3-5-sonnet-20241022",
+        default="claude-sonnet-5-5",
         description="Modelo Sonnet para componer respuestas",
     )
 
@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     api_base_url: str = Field(
         default="https://localhost:8000",
         description="URL pública para el callback del webhook",
+    )
+
+    # --- AWS (avisos al asesor) ---
+    aws_region: str = Field(default="us-east-1", description="Región de SES y S3")
+    ses_sender: str | None = Field(
+        default=None,
+        description="Remitente verificado en SES. Sin esto, los avisos por correo no se envían.",
     )
 
     # --- General ---

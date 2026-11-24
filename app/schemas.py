@@ -59,9 +59,38 @@ class MemoryScope(str, Enum):
     CUSTOMER = "customer"
 
 
+class ContentType(str, Enum):
+    """Tipo de mensaje. La lista la cierra un CHECK en la base (migracion 0011)."""
+
+    TEXT = "text"
+    IMAGE = "image"
+
+
+# Lo que lee el modelo en lugar de una imagen: el MVP no le pasa imagenes al LLM
+# (costo y alcance), asi que el agente sabe que hay una foto pero no la ve.
+IMAGE_PLACEHOLDER = "[El cliente envió una imagen]"
+
+
+def text_for_model(content_type: ContentType | str, content: str) -> str:
+    """Texto de un mensaje tal como lo ve el modelo (imagen -> marcador + pie)."""
+    if ContentType(content_type) == ContentType.IMAGE:
+        pie = content.strip()
+        return f"{IMAGE_PLACEHOLDER} {pie}" if pie else IMAGE_PLACEHOLDER
+    return content
+
+
 # ------------------------------------------------------------------
 # Mensaje normalizado (frontera canal <-> orquestador)
 # ------------------------------------------------------------------
+class InboundMedia(BaseModel):
+    """Referencia a un archivo del canal. El adaptador no lo descarga."""
+
+    content_type: ContentType
+    external_media_id: str
+    mime_type: str
+    caption: str = ""
+
+
 class InboundMessage(BaseModel):
     """Formato comun, agnostico al canal. Lo produce el adaptador."""
 
@@ -74,6 +103,9 @@ class InboundMessage(BaseModel):
     # Nombre del perfil del canal, si viene. Sirve para saludar por el nombre sin
     # tener que preguntarlo.
     display_name: str | None = None
+    # Adjunto, si el mensaje no es texto. `text` trae entonces lo que lee el
+    # modelo (marcador + pie de foto, ver `text_for_model`).
+    media: InboundMedia | None = None
 
 
 class OutboundMessage(BaseModel):
@@ -88,6 +120,17 @@ class OutboundMessage(BaseModel):
 # ------------------------------------------------------------------
 # Configuracion cargada en runtime
 # ------------------------------------------------------------------
+class CatalogEntry(BaseModel):
+    """Un ítem del catálogo tal como lo usa el orquestador."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    price: int
+    currency: str = "COP"
+
+
 class BusinessConfig(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -102,6 +145,9 @@ class BusinessConfig(BaseModel):
     # Conocimiento "base completa": texto estable que va al prefijo cacheado
     # del prompt (RNF-02). Debe ser deterministico: mismo input => mismo string.
     knowledge_context: str | None = None
+    # Lo que vende el negocio (activo), en orden estable. Va al prefijo cacheado
+    # como lista de referencias, sin precios: el precio lo pone el sistema.
+    catalog: list[CatalogEntry] = Field(default_factory=list)
 
 
 class AgentConfig(BaseModel):
@@ -212,13 +258,16 @@ __all__ = [
     "AgentConfig",
     "AgentCreate",
     "BusinessConfig",
+    "IMAGE_PLACEHOLDER",
     "CaptureRequestInput",
+    "ContentType",
     "ConversationContext",
     "ConversationStatus",
     "ConversationTurn",
     "CustomerMemory",
     "EscalationStatus",
     "HandlerResult",
+    "InboundMedia",
     "InboundMessage",
     "Intent",
     "KnowledgeHit",
@@ -229,4 +278,5 @@ __all__ = [
     "RequestStatus",
     "TurnUsage",
     "WhatsAppAck",
+    "text_for_model",
 ]

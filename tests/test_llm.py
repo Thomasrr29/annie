@@ -10,11 +10,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
 from app.core.llm import (
     _parse_classification,
     build_messages,
     build_system_prefix,
     estimate_cost,
+    run_agent_turn,
 )
 from app.core.tools import TOOL_SCHEMAS, tool_schemas_for
 from app.schemas import (
@@ -316,3 +319,77 @@ def test_los_tokens_de_cache_son_mas_baratos() -> None:
 
 def test_costo_cero_sin_tokens() -> None:
     assert estimate_cost("claude-3-5-sonnet-20241022", 0, 0) == 0.0
+
+
+# ======================================================================
+# Turno del agente: forma del request (regresiones contra la API real)
+# ======================================================================
+class _Bloque:
+    def __init__(self, **campos: Any) -> None:
+        self.__dict__.update(campos)
+
+
+class _Respuesta:
+    def __init__(self, contenido: list[_Bloque], stop_reason: str) -> None:
+        self.content = contenido
+        self.stop_reason = stop_reason
+        self.usage = _Bloque(
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        )
+
+
+async def test_un_agente_sin_herramientas_no_manda_el_campo_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La API rechaza `tools: null` con un 400: el campo se omite."""
+    pedidos: list[dict[str, Any]] = []
+
+    async def fake_call(**kwargs: Any) -> _Respuesta:
+        pedidos.append(kwargs)
+        return _Respuesta([_Bloque(type="text", text="Abrimos a las 9.")], "end_turn")
+
+    monkeypatch.setattr("app.core.llm._call_with_retry", fake_call)
+
+    resultado = await run_agent_turn(_agent(), _business(), _ctx(), "¿horario?", tools=None)
+
+    assert resultado.reply_text == "Abrimos a las 9."
+    assert "tools" not in pedidos[0]
+
+
+async def test_el_turno_con_herramientas_reenvia_el_contenido_sin_editar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Los bloques de thinking deben volver tal cual: editarlos invalida el turno."""
+    pensamiento = _Bloque(type="thinking", thinking="", signature="firma")
+    uso = _Bloque(type="tool_use", id="tu_1", name="notify_owner", input={"subject": "x"})
+    respuestas = [
+        _Respuesta([pensamiento, uso], "tool_use"),
+        _Respuesta([_Bloque(type="text", text="Listo, le avisé.")], "end_turn"),
+    ]
+    pedidos: list[dict[str, Any]] = []
+
+    async def fake_call(**kwargs: Any) -> _Respuesta:
+        pedidos.append({**kwargs, "messages": list(kwargs["messages"])})
+        return respuestas[len(pedidos) - 1]
+
+    async def ejecutor(nombre: str, entrada: dict[str, Any]) -> str:
+        return "ok"
+
+    monkeypatch.setattr("app.core.llm._call_with_retry", fake_call)
+
+    resultado = await run_agent_turn(
+        _agent(["notify_owner"]),
+        _business(),
+        _ctx(),
+        "avisale al dueño",
+        tools=tool_schemas_for(["notify_owner"]),
+        tool_executor=ejecutor,
+    )
+
+    assert resultado.reply_text == "Listo, le avisé."
+    turno_assistant = pedidos[1]["messages"][-2]
+    assert turno_assistant["role"] == "assistant"
+    assert turno_assistant["content"] == [pensamiento, uso]
