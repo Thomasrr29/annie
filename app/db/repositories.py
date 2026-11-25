@@ -185,6 +185,18 @@ class ConversationRepo(TenantScopedRepo):
             .values(active_agent_id=agent_id)
         )
 
+    async def mark_processed(self, business_id: UUID, conversation_id: UUID, seq: int) -> None:
+        """Los mensajes del cliente hasta `seq` ya entraron a un turno (no retrocede)."""
+        await self.session.execute(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.business_id == business_id,
+                Conversation.last_processed_seq < seq,
+            )
+            .values(last_processed_seq=seq)
+        )
+
     async def touch_last_message(
         self, business_id: UUID, conversation_id: UUID, when: dt.datetime | None = None
     ) -> None:
@@ -357,10 +369,14 @@ class MessageRepo(TenantScopedRepo):
         business_id: UUID,
         conversation_id: UUID,
         limit: int = DEFAULT_RECENT_TURNS,
+        answered_upto: int | None = None,
     ) -> list[ConversationTurn]:
         """
         Ultimos N turnos en orden cronologico (el mas antiguo primero), que es
         como los espera la API de mensajes.
+
+        Con `answered_upto`, deja afuera los mensajes del cliente posteriores a
+        esa marca: son los pendientes del turno, no historial.
 
         Se ordena por `seq` (orden de insercion), NO por `created_at`: now() es
         constante dentro de una transaccion, asi que los mensajes de un mismo
@@ -374,6 +390,12 @@ class MessageRepo(TenantScopedRepo):
             .order_by(Message.seq.desc())
             .limit(limit)
         )
+        if answered_upto is not None:
+            # Los mensajes del cliente aún no atendidos NO son historial: llegan al
+            # modelo como el mensaje nuevo del turno (ver `pending_customer`).
+            stmt = stmt.where(
+                (Message.role != MessageRole.CUSTOMER.value) | (Message.seq <= answered_upto)
+            )
         rows = (await self.session.execute(stmt)).scalars().all()
         # Las imagenes llegan al modelo como marcador + pie: el MVP no le pasa
         # imagenes al LLM, pero el agente tiene que saber que hubo una foto.
@@ -385,6 +407,39 @@ class MessageRepo(TenantScopedRepo):
             )
             for m in reversed(rows)
         ]
+
+    async def pending_customer(
+        self, business_id: UUID, conversation_id: UUID, after_seq: int
+    ) -> list[Message]:
+        """
+        Mensajes del cliente que todavía no entraron a ningún turno (invariante
+        I2: una ráfaga se responde una sola vez, todos juntos). En orden.
+        """
+        stmt = (
+            self._scoped(select(Message), Message, business_id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == MessageRole.CUSTOMER.value,
+                Message.seq > after_seq,
+            )
+            .order_by(Message.seq)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def has_newer_customer_message(
+        self, business_id: UUID, conversation_id: UUID, seq: int
+    ) -> bool:
+        """¿El cliente escribió algo después de este mensaje? (siguió escribiendo)."""
+        stmt = (
+            self._scoped(select(Message.id), Message, business_id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == MessageRole.CUSTOMER.value,
+                Message.seq > seq,
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).first() is not None
 
 
 # ======================================================================

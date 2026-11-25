@@ -50,6 +50,16 @@ class Settings(BaseSettings):
         description="URL pública para el callback del webhook",
     )
 
+    # --- Ráfagas (invariante I2) ---
+    turn_debounce_seconds: float = Field(
+        default=10.0,
+        ge=0,
+        description=(
+            "Espera antes de responder, por si el cliente sigue escribiendo: los "
+            "mensajes que lleguen en ese lapso se responden juntos, una sola vez."
+        ),
+    )
+
     # --- AWS (avisos al asesor) ---
     aws_region: str = Field(default="us-east-1", description="Región de SES y S3")
     ses_sender: str | None = Field(

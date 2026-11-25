@@ -1159,6 +1159,10 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
     resultado = await handle_inbound_message(inbound)
 
     motivos_sin_respuesta = {
+        TurnOutcomeKind.GROUPED: (
+            "El cliente siguió escribiendo: este mensaje se responde junto con los "
+            "siguientes, en una sola respuesta."
+        ),
         TurnOutcomeKind.HUMAN_MODE: (
             "La conversación está en modo humano: el agente no responde hasta que "
             "una persona la devuelva al agente desde la bandeja."

@@ -17,7 +17,7 @@ Demo para el curso: **escribirle por WhatsApp a annie, desplegada en AWS, como s
 | # | Pendiente | Origen | Pieza del arnés |
 |---|---|---|---|
 | B1 | `notify_owner` envía de verdad: hoy no avisa a nadie | Bloque 5 | Herramientas · **Hecho el 2026-11-24** con SES (`app/core/email_ses.py`). Probado con SES simulado; falta un envío real en AWS |
-| B2 | Espera de ráfaga + candado por conversación (I2) | Bloque 5 | Loop de control |
+| B2 | Espera de ráfaga + candado por conversación (I2) | Bloque 5 | Loop de control · **Hecho el 2026-11-25**: espera de 10 s (decisión de Thomas: "inmediato" puede ser ~10 s, como una persona), agrupa lo pendiente y responde una vez; un turno a la vez por conversación. Con el modelo real: 3 mensajes seguidos → 1 respuesta completa |
 | B3 | Cerrar la conversación tras 30 min de inactividad | Bloque 5 | Memoria |
 | B4 | Etapa del embudo por conversación; el **código** captura el lead al llegar a la etapa 3, sin duplicados (I5) | Bloques 2, 3 y 5 | Loop de control |
 | B5 | Resumen para el asesor armado **por el sistema** con campos validados (nombre, servicio, fecha preferida) | Bloques 3 y 5 | Validación |

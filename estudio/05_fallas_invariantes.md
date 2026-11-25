@@ -50,7 +50,7 @@ Una invariante es una regla **verificable por código** que nunca se rompe, sin 
 | # | Invariante | Origen | ¿annie la cumple hoy? |
 |---|---|---|---|
 | I1 | Todo precio, porcentaje o plazo que annie escribe existe en la base de conocimiento | Bloque 4 | ❌ Solo una regla en el prompt |
-| I2 | **Una ráfaga de mensajes del cliente recibe como máximo una respuesta** | Thomas | ❌ Cada mensaje dispara su propio turno en paralelo: 4 mensajes = 4 respuestas, que pueden cruzarse |
+| I2 | **Una ráfaga de mensajes del cliente recibe como máximo una respuesta** | Thomas | ✅ (2026-11-25) Espera de 10 s + agrupación + un turno a la vez por conversación (`conversations.last_processed_seq`, migración 0013). Antes: dos mensajes simultáneos daban dos respuestas, y la segunda repetía la primera |
 | I3 | **Un cliente nunca ve datos de otro cliente** (ni de su negocio ni de otro) | Thomas | ✅ Entre negocios: RLS. ⚠️ Entre clientes del mismo negocio: se filtra por `customer_id` en la aplicación, sin tests dedicados |
 | I4 | **Un número = un cliente por negocio, para siempre** | Thomas | ✅ `UniqueConstraint(business_id, channel, channel_identifier)` + `get_or_create` |
 | I5 | Nunca se crean dos leads de la misma conversación por la misma intención | Bloque 5 | ❌ No hay detección de repetición |

@@ -22,13 +22,19 @@ recibe una respuesta honesta, incluso si el modelo o una herramienta fallan.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final
 from uuid import UUID
 
+from sqlalchemy import select
+
+from app.config import settings
 from app.core import tools as tools_module
 from app.core.catalog import render_prices, verification_lines
 from app.core.channel_whatsapp import (
@@ -53,6 +59,7 @@ from app.core.llm import (
     classify,
     run_agent_turn,
 )
+from app.db.models import Conversation, Message
 from app.db.repositories import (
     AgentRepo,
     BusinessRepo,
@@ -76,6 +83,7 @@ from app.schemas import (
     MessageRole,
     OutboundMessage,
     TurnUsage,
+    text_for_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +110,7 @@ class TurnOutcomeKind(str, Enum):
     """Cómo terminó el turno. El webhook lo ignora; el sandbox lo muestra."""
 
     REPLIED = "respondido"
+    GROUPED = "agrupado"  # el cliente siguió escribiendo: responde el turno del último mensaje
     HUMAN_MODE = "modo_humano"  # el agente calla: la conversación es de una persona (F6)
     RATE_LIMITED = "rate_limit"  # respuesta fija, sin modelo ni registro del turno
     DAILY_LIMIT = "limite_diario"  # circuit breaker del negocio: escala sin modelo
@@ -151,11 +160,46 @@ async def handle_inbound_message(
     # antes de abrir la transaccion (no se retiene una conexion durante la red).
     archivo = await _descargar_media(inbound)
 
-    ctx, business, message_in_id = await _resolve_and_load(inbound, archivo)
+    # Paso 1: el mensaje queda guardado YA, antes de esperar.
+    guardado = await _save_inbound(inbound, archivo)
 
-    # Paso 3: modo humano -> el agente calla (F6, RF-12).
+    # Invariante I2: la gente escribe en varios mensajes seguidos. Se espera unos
+    # segundos (como una persona que deja terminar al otro) y, si el cliente
+    # siguió escribiendo, este turno no responde: el del último mensaje responde
+    # todo junto. Thomas: "respuesta inmediata" puede ser ~10 s.
+    if settings.turn_debounce_seconds > 0:
+        await asyncio.sleep(settings.turn_debounce_seconds)
+        if await _hay_mensaje_mas_nuevo(business_id, guardado):
+            return TurnOutcome(TurnOutcomeKind.GROUPED, None, guardado.message_id)
+
+    # Un turno a la vez por conversación: si otro turno sigue respondiendo, se
+    # espera a que termine para leer el historial CON su respuesta.
+    async with _turno_exclusivo(guardado.conversation_id):
+        return await _turno(inbound, guardado, phone_number_id, inicio)
+
+
+async def _turno(
+    inbound: InboundMessage, guardado: _Guardado, phone_number_id: str | None, inicio: float
+) -> TurnOutcome:
+    """Pasos 2-8, con la conversación tomada por este turno."""
+    business_id = inbound.business_id
+    ctx, business, pendientes = await _load_turn(business_id, guardado)
+
+    if not pendientes:
+        # Un turno anterior ya respondió este mensaje junto con otros.
+        return TurnOutcome(TurnOutcomeKind.GROUPED, None, guardado.message_id)
+
+    # La ráfaga completa llega al modelo como UN mensaje, en orden.
+    texto_cliente = "\n".join(text_for_model(m.content_type, m.content) for m in pendientes)
+    inbound = inbound.model_copy(update={"text": texto_cliente})
+    message_in_id: UUID | None = pendientes[-1].id
+    hasta_seq = pendientes[-1].seq
+
+    # Paso 3: modo humano -> el agente calla (F6, RF-12). Los mensajes quedan
+    # marcados como atendidos: si después se devuelve al agente, no los responde.
     if ctx.status == ConversationStatus.HUMAN:
         logger.info("conversacion %s en modo humano; no se responde", ctx.conversation_id)
+        await _mark_processed(business_id, ctx.conversation_id, hasta_seq)
         return TurnOutcome(TurnOutcomeKind.HUMAN_MODE, None, message_in_id)
 
     # Circuit breaker de costo por tenant: al superarlo se escala a humano en vez
@@ -170,6 +214,7 @@ async def handle_inbound_message(
             TurnUsage(),
             message_in_id,
             int((time.monotonic() - inicio) * 1000),
+            hasta_seq,
         )
         await _send_reply(inbound, RESPUESTA_LIMITE_DIARIO, phone_number_id)
         return TurnOutcome(TurnOutcomeKind.DAILY_LIMIT, RESPUESTA_LIMITE_DIARIO, message_in_id)
@@ -210,7 +255,9 @@ async def handle_inbound_message(
         intent = Intent.ESCALATE
 
     latencia_ms = int((time.monotonic() - inicio) * 1000)
-    await _persist_turn(inbound, ctx, intent, agent, result, usage, message_in_id, latencia_ms)
+    await _persist_turn(
+        inbound, ctx, intent, agent, result, usage, message_in_id, latencia_ms, hasta_seq
+    )
 
     # Aviso de tratamiento de datos en el PRIMER contacto (RNF-05, Ley 1581).
     # Va pegado a la primera respuesta para no gastar un mensaje aparte.
@@ -244,16 +291,27 @@ async def _descargar_media(inbound: InboundMessage) -> tuple[bytes, str] | None:
         return None
 
 
-async def _resolve_and_load(
+@dataclass(frozen=True)
+class _Guardado:
+    """Lo que deja el paso 1: el mensaje entrante ya está en la base."""
+
+    conversation_id: UUID
+    customer_id: UUID
+    message_id: UUID
+    seq: int
+
+
+async def _save_inbound(
     inbound: InboundMessage,
     archivo: tuple[bytes, str] | None = None,
-) -> tuple[ConversationContext, BusinessConfig, UUID | None]:
+) -> _Guardado:
     """
-    Upsert de cliente, conversacion activa, guardado del mensaje entrante (con
-    su imagen, si la hay) y carga del contexto (historial + memoria).
+    Paso 1: upsert de cliente y conversación, y guardado del mensaje entrante
+    (con su imagen, si la hay). Una transacción corta: si algo falla, no queda
+    un cliente sin conversación ni un mensaje colgado.
 
-    Todo en una transaccion: si algo falla, no queda un cliente sin conversacion
-    ni un mensaje colgado.
+    El mensaje se guarda YA, antes de la espera de ráfaga: así un turno
+    posterior lo ve como pendiente y lo agrupa.
     """
     business_id = inbound.business_id
 
@@ -270,17 +328,9 @@ async def _resolve_and_load(
         )
 
         msg_repo = MessageRepo(session)
-
-        # El historial se lee ANTES de guardar el entrante: el mensaje nuevo le
-        # llega al modelo aparte (`message` en classify/run_agent_turn, y
-        # build_messages lo agrega al final). Leerlo después lo duplicaba en el
-        # prompt, y con eso el modelo confundía precios (estudio/experimento_tinte.md:
-        # 6 de 12 respuestas con el precio de otro servicio).
-        recent = await msg_repo.recent(business_id, conversation.id)
-
         if inbound.media is not None:
             # Se guarda el pie de foto; el marcador para el modelo lo agrega
-            # `recent()` al leer el historial.
+            # `text_for_model` al leer.
             entrante = await msg_repo.append(
                 business_id,
                 conversation.id,
@@ -303,24 +353,88 @@ async def _resolve_and_load(
             )
         await conv_repo.touch_last_message(business_id, conversation.id, inbound.received_at)
 
-        memoria = await MemoryRepo(session).get(business_id, customer.id)
+        return _Guardado(conversation.id, customer.id, entrante.id, entrante.seq)
+
+
+async def _load_turn(
+    business_id: UUID, guardado: _Guardado
+) -> tuple[ConversationContext, BusinessConfig, list[Message]]:
+    """
+    Paso 2: contexto del turno, ya dentro del candado de la conversación.
+
+    - Pendientes: los mensajes del cliente que todavía no entraron a ningún turno
+      (la ráfaga completa, en orden). Llegan al modelo juntos, como el mensaje nuevo.
+    - Historial: todo lo demás. Los pendientes NO van ahí: si fueran, el modelo los
+      vería dos veces (estudio/experimento_tinte.md).
+    """
+    async with tenant_session(business_id) as session:
+        conversation = (
+            await session.execute(
+                select(Conversation).where(
+                    Conversation.id == guardado.conversation_id,
+                    Conversation.business_id == business_id,
+                )
+            )
+        ).scalar_one()
+        msg_repo = MessageRepo(session)
+        atendidos = conversation.last_processed_seq
+        pendientes = await msg_repo.pending_customer(
+            business_id, guardado.conversation_id, atendidos
+        )
+        recent = await msg_repo.recent(
+            business_id, guardado.conversation_id, answered_upto=atendidos
+        )
+        memoria = await MemoryRepo(session).get(business_id, guardado.customer_id)
         business = await BusinessRepo(session).get_config(business_id)
 
         ctx = ConversationContext(
-            conversation_id=conversation.id,
-            customer_id=customer.id,
+            conversation_id=guardado.conversation_id,
+            customer_id=guardado.customer_id,
             status=ConversationStatus(conversation.status),
             active_agent_id=conversation.active_agent_id,
             flow_state=dict(conversation.flow_state or {}),
             recent_turns=recent,
             customer_memory=memoria,
         )
-        message_in_id = entrante.id
 
     if business is None:
         raise RuntimeError(f"negocio {business_id} sin configuracion")
 
-    return ctx, business, message_in_id
+    return ctx, business, pendientes
+
+
+async def _mark_processed(business_id: UUID, conversation_id: UUID, seq: int) -> None:
+    async with tenant_session(business_id) as session:
+        await ConversationRepo(session).mark_processed(business_id, conversation_id, seq)
+
+
+async def _hay_mensaje_mas_nuevo(business_id: UUID, guardado: _Guardado) -> bool:
+    async with tenant_session(business_id) as session:
+        return await MessageRepo(session).has_newer_customer_message(
+            business_id, guardado.conversation_id, guardado.seq
+        )
+
+
+# Un turno a la vez por conversación (invariante I2). En memoria del proceso:
+# alcanza porque la API corre con UN worker en UNA instancia (Dockerfile). Con
+# varias instancias habría que pasarlo a Postgres (pg_advisory_lock).
+_candados: dict[UUID, asyncio.Lock] = {}
+_en_uso: dict[UUID, int] = {}
+
+
+@asynccontextmanager
+async def _turno_exclusivo(conversation_id: UUID) -> AsyncIterator[None]:
+    candado = _candados.setdefault(conversation_id, asyncio.Lock())
+    _en_uso[conversation_id] = _en_uso.get(conversation_id, 0) + 1
+    try:
+        async with candado:
+            yield
+    finally:
+        _en_uso[conversation_id] -= 1
+        if _en_uso[conversation_id] == 0:
+            # Nadie más lo usa ni lo espera: no acumular un candado por conversación.
+            del _en_uso[conversation_id]
+            _candados.pop(conversation_id, None)
 
 
 # ======================================================================
@@ -679,9 +793,13 @@ async def _persist_turn(
     usage: TurnUsage,
     message_in_id: UUID | None,
     latencia_ms: int,
+    processed_upto_seq: int,
 ) -> None:
     """
     Guarda la respuesta y todos los efectos del turno en una sola transaccion.
+
+    Marca como atendidos los mensajes del cliente hasta `processed_upto_seq`, en
+    la MISMA transacción que la respuesta: o quedan los dos, o ninguno.
 
     `turn_logs` se escribe SIEMPRE (RF-15): es la base de la metrica de costo por
     conversacion y del ahorro de cache (RNF-02).
@@ -695,6 +813,7 @@ async def _persist_turn(
         )
 
         conv_repo = ConversationRepo(session)
+        await conv_repo.mark_processed(business_id, ctx.conversation_id, processed_upto_seq)
 
         if result.new_flow_state is not None:
             await conv_repo.update_flow_state(

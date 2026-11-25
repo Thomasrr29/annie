@@ -9,6 +9,7 @@ La base es real; lo unico simulado es la API de Anthropic y el envio a WhatsApp.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
@@ -56,6 +57,7 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "raise_llm_error": False,
         "enviados": [],
         "classify_calls": 0,
+        "en_modelo": asyncio.Event(),
     }
 
     async def fake_classify(message: str, ctx: Any, agents: list[Any]) -> ClassifyResult:
@@ -80,6 +82,9 @@ def mock_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         estado.setdefault("llamadas_turno", []).append(
             {"message": kwargs.get("message"), "tools": kwargs.get("tools")}
         )
+        estado["en_modelo"].set()  # señal: el turno ya está esperando al modelo
+        if estado.get("demora"):
+            await asyncio.sleep(estado["demora"])  # un modelo que tarda en responder
         if estado["raise_llm_error"]:
             raise LLMError("fallo simulado del modelo")
         # "reply" puede ser una lista: una respuesta por llamada (guardia de precios).
@@ -865,3 +870,88 @@ async def test_catalogo_una_referencia_inventada_nunca_sale(
     assert resultado.reply_text is not None
     assert "{{" not in resultado.reply_text
     assert "precio equivocado" in resultado.reply_text
+
+
+
+# ======================================================================
+# Ráfagas (invariante I2): una ráfaga recibe UNA respuesta
+# ======================================================================
+async def test_rafaga_se_responde_una_sola_vez(
+    negocio: UUID, mock_llm: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    "hola" · "quería saber el precio" llegan seguidos: el primer turno ve que el
+    cliente siguió escribiendo y no responde; el segundo responde todo junto.
+    """
+    from app.config import settings
+    from app.core.orchestrator import TurnOutcomeKind
+
+    monkeypatch.setattr(settings, "turn_debounce_seconds", 0.4)
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["reply"] = "¡Hola! Te cuento los precios."
+
+    async def segundo() -> Any:
+        await asyncio.sleep(0.1)
+        return await handle_inbound_message(
+            _mensaje(negocio, "quería saber el precio", "573007770001")
+        )
+
+    primero, ultimo = await asyncio.gather(
+        handle_inbound_message(_mensaje(negocio, "hola", "573007770001")), segundo()
+    )
+
+    assert primero.kind == TurnOutcomeKind.GROUPED and primero.reply_text is None
+    assert ultimo.kind == TurnOutcomeKind.REPLIED
+    assert len(mock_llm["llamadas_turno"]) == 1, "una ráfaga = una llamada al modelo"
+    assert len(mock_llm["enviados"]) == 1, "una ráfaga = una respuesta"
+    assert mock_llm["mensaje_al_modelo"] == "hola\nquería saber el precio"
+    assert mock_llm["ctx_al_modelo"].recent_turns == []
+
+
+async def test_mensaje_mientras_el_agente_responde_no_repite_lo_anterior(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """
+    Regresión (prueba final, 2026-11-25): "¿hacen keratina?" llegó mientras el
+    agente respondía los precios. Los dos turnos corrían a la vez y el segundo,
+    sin la primera respuesta en el historial, volvía a saludar y a dar precios.
+    Ahora el segundo espera su turno y ve la respuesta anterior.
+    """
+    mock_llm["intent"] = Intent.INFORM
+    mock_llm["demora"] = 0.3
+    mock_llm["reply"] = ["Atendemos de 8 a 18.", "No tengo información de la keratina."]
+
+    async def segundo() -> Any:
+        # Llega cuando el primer turno ya leyó la conversación y espera al modelo.
+        await mock_llm["en_modelo"].wait()
+        return await handle_inbound_message(_mensaje(negocio, "¿hacen keratina?", "573007770002"))
+
+    await asyncio.gather(
+        handle_inbound_message(_mensaje(negocio, "¿qué horario tienen?", "573007770002")),
+        segundo(),
+    )
+
+    llamadas = mock_llm["llamadas_turno"]
+    assert [ll["message"] for ll in llamadas] == ["¿qué horario tienen?", "¿hacen keratina?"]
+    historial = [t.content for t in mock_llm["ctx_al_modelo"].recent_turns]
+    assert historial == ["¿qué horario tienen?", "Atendemos de 8 a 18."]
+
+
+async def test_lo_que_llega_en_modo_humano_no_lo_responde_despues_el_agente(
+    negocio: UUID, mock_llm: dict[str, Any]
+) -> None:
+    """Al devolver la conversación al agente, no contesta lo que ya atendió la persona."""
+    mock_llm["intent"] = Intent.ESCALATE
+    await handle_inbound_message(_mensaje(negocio, "quiero hablar con alguien", "573007770003"))
+    await handle_inbound_message(_mensaje(negocio, "mensaje para la persona", "573007770003"))
+
+    async with system_session() as s:
+        await set_tenant(s, negocio)
+        await s.execute(
+            text("UPDATE conversations SET status = 'auto' WHERE business_id = :b"), {"b": negocio}
+        )
+
+    mock_llm["intent"] = Intent.INFORM
+    await handle_inbound_message(_mensaje(negocio, "ya volví, ¿horarios?", "573007770003"))
+
+    assert mock_llm["mensaje_al_modelo"] == "ya volví, ¿horarios?"

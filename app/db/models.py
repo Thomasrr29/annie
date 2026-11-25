@@ -265,6 +265,10 @@ class Conversation(Base):
     updated_at: Mapped[dt.datetime] = _updated_at()
     # Hasta donde leyo el negocio en la bandeja (migracion 0011).
     owner_last_read_at: Mapped[dt.datetime | None] = _optional_timestamp()
+    # Migración 0013: seq del último mensaje del cliente que ya entró a un turno.
+    last_processed_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
 
 
 # ============================================================
