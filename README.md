@@ -18,9 +18,9 @@ cp .env.example .env        # completar ANTHROPIC_API_KEY y credenciales de What
 # 2. Base de datos (Postgres 16 + pgvector)
 docker compose up -d
 
-# 3. Entorno de Python
+# 3. Entorno de Python (versiones exactas: ver "Versiones de dependencias")
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -c constraints.txt -e ".[dev]"
 
 # 4. Migraciones
 .venv/bin/alembic upgrade head
@@ -53,7 +53,7 @@ intención detectada, el agente enrutado, las herramientas usadas y el costo.
 ### Panel de administración (Streamlit)
 
 ```bash
-.venv/bin/pip install -e ".[panel]"
+.venv/bin/pip install -c constraints.txt -e ".[panel]"
 .venv/bin/streamlit run panel/app.py        # http://localhost:8501
 ```
 
@@ -202,3 +202,28 @@ error: saltarse los tests de aislamiento equivale a no probarlo.
 Fases 1–7 implementadas y con tests. Pendiente del cierre del MVP (fase 7):
 **operar el piloto con un negocio real durante una semana** y documentar los
 números (% resuelto sin humano, escalamientos, costo/conversación).
+
+## Versiones de dependencias
+
+Dos archivos, con papeles distintos:
+
+| Archivo | Qué dice |
+|---|---|
+| `pyproject.toml` | Los **rangos** que acepta el proyecto: desde la versión más vieja probada hasta antes del siguiente *major* (por ejemplo `anthropic>=0.120,<3`). |
+| `constraints.txt` | La versión **exacta** de cada paquete, incluidas las dependencias de las dependencias (82 paquetes). |
+
+Todo se instala con `-c constraints.txt`: el PC, el CI (`.github/workflows/ci.yml`) y la imagen Docker (`Dockerfile`). Así los tres corren exactamente el mismo software. Sin este archivo, cada instalación tomaba "lo último" y el CI terminó probando SQLAlchemy 2.1 mientras en local había 2.0.
+
+**Actualizar versiones** (cuando se quiera, no en automático):
+
+1. Resolver lo último dentro de los rangos, en Linux (como producción):
+
+   ```bash
+   docker run --rm -v "$PWD:/src:ro" python:3.12-slim sh -c \
+     "mkdir /tmp/p && cp -r /src/pyproject.toml /src/README.md /src/app /src/scripts /tmp/p && \
+      pip install -q --root-user-action=ignore '/tmp/p[dev,panel]' && pip freeze --exclude agente-soporte-mvp"
+   ```
+
+2. Reemplazar las líneas `paquete==versión` de `constraints.txt` con esa salida. Mantener `colorama` y `tzdata`, que solo se instalan en Windows y no salen en la resolución de Linux.
+3. Reinstalar con `-c constraints.txt` y correr lo mismo que el CI: `ruff check .`, `mypy app scripts`, el mypy del panel y `pytest`.
+4. Si algo se rompe, ajustar el código o bajar el tope en `pyproject.toml`. Hacer commit de los dos archivos juntos.

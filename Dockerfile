@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /srv/annie
 
 # Primero solo lo que define dependencias, para aprovechar la caché de capas.
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md constraints.txt ./
 COPY app ./app
 COPY scripts ./scripts
 
@@ -24,7 +24,8 @@ RUN useradd --system --uid 10001 --no-create-home annie
 
 FROM base AS api
 
-RUN pip install .
+# -c constraints.txt: versiones exactas, las mismas que pasaron los tests.
+RUN pip install -c constraints.txt .
 
 COPY alembic.ini ./
 COPY migrations ./migrations
@@ -43,7 +44,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
 
 FROM base AS panel
 
-RUN pip install ".[panel]"
+RUN pip install -c constraints.txt ".[panel]"
 
 COPY panel ./panel
 
