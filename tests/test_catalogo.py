@@ -94,3 +94,27 @@ def test_el_prompt_del_agente_lista_el_catalogo_sin_cifras() -> None:
     assert "{{precio:tinte-completo}}" in prefijo
     assert "90.000" not in prefijo and "90000" not in prefijo
     assert "NUNCA escribas un precio con números" in prefijo
+
+
+def test_el_prompt_avisa_que_los_numeros_del_historial_los_puso_el_sistema() -> None:
+    """
+    Regresión (prueba final, 2026-11-25): el modelo veía sus mensajes anteriores
+    con los precios ya reemplazados ("$90.000") y, como la regla dice "nunca
+    escribas números", se disculpaba por un error que no cometió ("Una
+    corrección: escribí los precios mal"). Con el historial real pasaba en ~1 de
+    cada 4 respuestas; con este aviso, 0 de 24.
+    """
+    from app.core.llm import build_system_prefix
+    from app.schemas import AgentConfig, BusinessConfig
+
+    bid = uuid4()
+    agente = AgentConfig(
+        id=uuid4(), business_id=bid, name="Agendador",
+        routing_description="agenda citas", instructions_md="# Rol",
+    )
+    prefijo = build_system_prefix(agente, BusinessConfig(id=bid, name="X", catalog=PELUQUERIA))[0][
+        "text"
+    ]
+
+    assert "los puso el sistema" in prefijo
+    assert "No los corrijas" in prefijo
