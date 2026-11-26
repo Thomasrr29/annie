@@ -26,6 +26,7 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from typing import Final
 
 from app.core.catalog import strip_references
 
@@ -187,4 +188,47 @@ def hand_written_amounts(text: str) -> list[str]:
     return [m.group(0).strip() for m in _MONTO.finditer(strip_references(text))]
 
 
-__all__ = ["PriceIssue", "check_prices", "hand_written_amounts"]
+# ======================================================================
+# Promesas sin respaldo (invariante I8)
+# ======================================================================
+# Prueba del 2026-11-25: el Informador (sin herramientas) escribió "Le paso tu
+# solicitud a una persona del salón… ellos te confirman por acá". No pasó nada a
+# nadie. Igual que con los precios, el modelo afirmó algo que el sistema no hizo.
+#
+# Se buscan AFIRMACIONES de una acción hecha (pasar el caso, avisar, registrar,
+# agendar). Las OFERTAS no cuentan: una pregunta ("¿quieres que te pase…?") o un
+# condicional ("si quieres, le paso…") no prometen nada todavía.
+# "le paso tu solicitud" · "te paso con alguien" · "le avisé" · "registré" / "agendé"
+# · "quedó registrada"
+_PROMESAS: Final = [
+    re.compile(p)
+    for p in (
+        r"\b(le|les)\s+(paso|pase|pasare)\s+(tu|su|la|el|los|las|este|esta)\b",
+        r"\bte\s+(paso|pasare)\s+con\b",
+        r"\b(le|les)\s+(avise|aviso|avisare)\b",
+        r"\b(ya\s+)?(registre|agende)\b",
+        r"\b(quedo|queda|quedaron|deje|dejo)\s+(registrad|agendad|programad)[oa]s?\b",
+    )
+]
+_OFERTA: Final = re.compile(
+    r"\?|\bsi\s+(quieres|deseas|prefieres|gustas|te\s+parece)\b|\bpuedo\b|\bpodria\b"
+)
+
+
+def unbacked_promises(reply: str) -> list[str]:
+    """
+    Frases donde el agente afirma haber pasado el caso, avisado, registrado o
+    agendado. El llamador decide si están respaldadas (si en el turno se usó la
+    herramienta de verdad). Lista vacía = no promete nada.
+    """
+    encontradas: list[str] = []
+    for frase in _FIN_DE_FRASE.split(reply):
+        normal = _sin_tildes(frase)
+        if _OFERTA.search(normal):
+            continue
+        if any(p.search(normal) for p in _PROMESAS):
+            encontradas.append(frase.strip())
+    return encontradas
+
+
+__all__ = ["PriceIssue", "check_prices", "hand_written_amounts", "unbacked_promises"]

@@ -301,6 +301,7 @@ class MessageRepo(TenantScopedRepo):
         role: MessageRole,
         content: str,
         content_type: ContentType = ContentType.TEXT,
+        transcription_status: str | None = None,
     ) -> Message:
         """
         RF-16. Persiste un turno del historial.
@@ -314,10 +315,30 @@ class MessageRepo(TenantScopedRepo):
             role=role.value,
             content=content,
             content_type=content_type.value,
+            transcription_status=transcription_status,
         )
         self.session.add(message)
         await self.session.flush()
         return message
+
+    async def get_many(self, business_id: UUID, ids: list[UUID]) -> list[Message]:
+        """Mensajes por id, en orden de llegada."""
+        stmt = (
+            self._scoped(select(Message), Message, business_id)
+            .where(Message.id.in_(ids))
+            .order_by(Message.seq)
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def set_transcription(
+        self, business_id: UUID, message_id: UUID, status: str, text: str = ""
+    ) -> None:
+        """Guarda el resultado de la transcripción de una nota de voz."""
+        await self.session.execute(
+            update(Message)
+            .where(Message.id == message_id, Message.business_id == business_id)
+            .values(transcription_status=status, content=text)
+        )
 
     async def list_for_inbox(
         self,
@@ -357,6 +378,7 @@ class MessageRepo(TenantScopedRepo):
                 "role": m.role,
                 "content_type": m.content_type,
                 "content": m.content,
+                "transcription_status": m.transcription_status,
                 "created_at": m.created_at,
                 "media_id": media_id,
                 "media_mime_type": mime,
@@ -402,7 +424,7 @@ class MessageRepo(TenantScopedRepo):
         return [
             ConversationTurn(
                 role=MessageRole(m.role),
-                content=text_for_model(m.content_type, m.content),
+                content=text_for_model(m.content_type, m.content, m.transcription_status),
                 created_at=m.created_at,
             )
             for m in reversed(rows)

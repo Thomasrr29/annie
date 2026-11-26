@@ -49,13 +49,14 @@ Una invariante es una regla **verificable por código** que nunca se rompe, sin 
 
 | # | Invariante | Origen | ¿annie la cumple hoy? |
 |---|---|---|---|
-| I1 | Todo precio, porcentaje o plazo que annie escribe existe en la base de conocimiento | Bloque 4 | ❌ Solo una regla en el prompt |
+| I1 | Todo precio, porcentaje o plazo que annie escribe existe en la base de conocimiento | Bloque 4 | ✅ Guardia de precios en código (`app/core/guards.py`) + catálogo `{{precio:clave}}` que pinta el sistema. Antes: solo una regla en el prompt |
 | I2 | **Una ráfaga de mensajes del cliente recibe como máximo una respuesta** | Thomas | ✅ (2026-11-25) Espera de 10 s + agrupación + un turno a la vez por conversación (`conversations.last_processed_seq`, migración 0013). Antes: dos mensajes simultáneos daban dos respuestas, y la segunda repetía la primera |
 | I3 | **Un cliente nunca ve datos de otro cliente** (ni de su negocio ni de otro) | Thomas | ✅ Entre negocios: RLS. ⚠️ Entre clientes del mismo negocio: se filtra por `customer_id` en la aplicación, sin tests dedicados |
 | I4 | **Un número = un cliente por negocio, para siempre** | Thomas | ✅ `UniqueConstraint(business_id, channel, channel_identifier)` + `get_or_create` |
 | I5 | Nunca se crean dos leads de la misma conversación por la misma intención | Bloque 5 | ❌ No hay detección de repetición |
 | I6 | Si la conversación está en modo humano, annie no envía nada | Ficha | ✅ El orquestador retorna antes de responder |
 | I7 | El historial nunca entra a la base de conocimiento sin aprobación humana | `CLAUDE.md` decisión 10 | ✅ Hoy no existe ese camino. Cuidado con la v2 "auto-mejora" |
+| I8 | **annie nunca dice que pasó el caso, avisó, registró o agendó si en ese turno no lo hizo** | Thomas (prueba del 2026-11-25) | ✅ (2026-11-25) Guardia de promesas (`unbacked_promises`): si no se usó `capture_request` ni `notify_owner`, el modelo corrige una vez; si insiste, sale una respuesta que **ofrece** el pase. Antes: el Informador escribió "Le paso tu solicitud…" y no se registró nada |
 
 ### Requisitos de diseño (no invariantes)
 

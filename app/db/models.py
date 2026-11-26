@@ -296,6 +296,8 @@ class Message(Base):
     # vive en `message_media` (migracion 0011).
     content: Mapped[str] = mapped_column(Text, nullable=False)
     content_type: Mapped[str] = mapped_column(Text, nullable=False, server_default="text")
+    # Migración 0014: solo para notas de voz (pending | done | failed | too_long).
+    transcription_status: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = _created_at()
 
 

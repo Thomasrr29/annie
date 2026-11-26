@@ -60,10 +60,11 @@ class MemoryScope(str, Enum):
 
 
 class ContentType(str, Enum):
-    """Tipo de mensaje. La lista la cierra un CHECK en la base (migracion 0011)."""
+    """Tipo de mensaje. La lista la cierra un CHECK en la base (migraciones 0011 y 0014)."""
 
     TEXT = "text"
     IMAGE = "image"
+    AUDIO = "audio"  # nota de voz: `content` es su transcripción
 
 
 # Lo que lee el modelo en lugar de una imagen: el MVP no le pasa imagenes al LLM
@@ -71,11 +72,29 @@ class ContentType(str, Enum):
 IMAGE_PLACEHOLDER = "[El cliente envió una imagen]"
 
 
-def text_for_model(content_type: ContentType | str, content: str) -> str:
-    """Texto de un mensaje tal como lo ve el modelo (imagen -> marcador + pie)."""
-    if ContentType(content_type) == ContentType.IMAGE:
+# Lo que lee el modelo de una nota de voz, según cómo terminó su transcripción.
+# El texto del cliente va siempre DESPUÉS del marcador: es dato, no instrucción.
+AUDIO_PLACEHOLDERS: dict[str, str] = {
+    "done": "[Nota de voz del cliente, transcrita]",
+    "pending": "[El cliente envió una nota de voz que todavía se está transcribiendo]",
+    "failed": "[El cliente envió una nota de voz que no se pudo escuchar]",
+    "too_long": "[El cliente envió una nota de voz de más de 2 minutos: no se transcribió]",
+}
+
+
+def text_for_model(
+    content_type: ContentType | str, content: str, transcription_status: str | None = None
+) -> str:
+    """Texto de un mensaje tal como lo ve el modelo (imagen/audio -> marcador + contenido)."""
+    tipo = ContentType(content_type)
+    if tipo == ContentType.IMAGE:
         pie = content.strip()
         return f"{IMAGE_PLACEHOLDER} {pie}" if pie else IMAGE_PLACEHOLDER
+    if tipo == ContentType.AUDIO:
+        estado = transcription_status or "pending"
+        marcador = AUDIO_PLACEHOLDERS.get(estado, AUDIO_PLACEHOLDERS["pending"])
+        texto = content.strip()
+        return f"{marcador} {texto}" if texto and transcription_status == "done" else marcador
     return content
 
 

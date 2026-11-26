@@ -60,6 +60,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Transcripción de audios (app/core/transcription.py) ---
+    # "none" por ahora (decisión de Thomas, 2026-11-25): Amazon Transcribe no está
+    # en el plan gratuito de AWS. Con "none", las notas de voz se responden con
+    # el aviso fijo de audio no procesado. Para activar un proveedor: "amazon"
+    # (requiere el plan pago de AWS) o uno nuevo registrado en transcription.py.
+    transcription_provider: str = Field(
+        default="none",
+        description="Proveedor de transcripción: 'none' (desactivado) o 'amazon' (Transcribe).",
+    )
+    transcription_language: str = Field(
+        default="es", description="Idioma de las notas de voz (código base: es, en, pt…)."
+    )
+
     # --- AWS (avisos al asesor) ---
     aws_region: str = Field(default="us-east-1", description="Región de SES y S3")
     ses_sender: str | None = Field(

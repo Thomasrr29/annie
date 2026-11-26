@@ -151,14 +151,30 @@ def test_phone_number_id_ausente_devuelve_none() -> None:
     assert extract_phone_number_id({"entry": []}) is None
 
 
-@pytest.mark.parametrize("tipo", ["audio", "location", "sticker", "document", "video"])
+@pytest.mark.parametrize("tipo", ["location", "sticker", "document", "video"])
 def test_tipos_no_soportados_se_senalan(tipo: str) -> None:
-    """El MVP lee texto e imagen; el resto se contesta con amabilidad."""
+    """El MVP lee texto, imagen y audio; el resto se contesta con amabilidad."""
     with pytest.raises(UnsupportedMessageType) as exc:
         adapt_whatsapp_payload(_payload_texto(tipo=tipo), uuid4())
 
     assert exc.value.message_type == tipo
     assert exc.value.sender == "573001112233"
+
+
+def test_una_nota_de_voz_entra_como_mensaje_de_audio() -> None:
+    """El audio ya no se rechaza: entra al flujo y se transcribe después."""
+    payload = _payload_texto(tipo="audio")
+    mensaje = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    mensaje["audio"] = {"id": "audio-1", "mime_type": "audio/ogg; codecs=opus", "voice": True}
+
+    inbound = adapt_whatsapp_payload(payload, uuid4())
+
+    assert inbound.media is not None
+    assert inbound.media.content_type == ContentType.AUDIO
+    assert inbound.media.external_media_id == "audio-1"
+    # El mime completo se conserva: el proveedor de transcripción lo necesita.
+    assert inbound.media.mime_type == "audio/ogg; codecs=opus"
+    assert "nota de voz" in inbound.text
 
 
 def test_acuses_de_entrega_se_reconocen() -> None:

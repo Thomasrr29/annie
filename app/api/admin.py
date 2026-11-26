@@ -207,6 +207,9 @@ class SandboxResponse(BaseModel):
     reply_text: str
     replied: bool = True
     outcome: str = "respondido"
+    # Id del mensaje del agente que se guardó: el panel lo usa para mostrar la
+    # traza junto al mensaje correcto del hilo.
+    reply_message_id: UUID | None = None
     no_reply_reason: str | None = None
     detected_intent: str | None = None
     routed_agent: str | None = None
@@ -803,6 +806,7 @@ async def get_conversation(
                 "role": m["role"],
                 "content_type": m["content_type"],
                 "content": m["content"],
+                "transcription_status": m.get("transcription_status"),
                 "created_at": _iso(m["created_at"]),
                 "media_id": str(m["media_id"]) if m["media_id"] else None,
                 "media_mime_type": m["media_mime_type"],
@@ -1203,6 +1207,7 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
         reply_text=resultado.reply_text or "",
         replied=resultado.replied,
         outcome=resultado.kind.value,
+        reply_message_id=log.message_out_id if log else None,
         no_reply_reason=None if resultado.replied else motivos_sin_respuesta.get(
             resultado.kind, "El agente no respondió este mensaje."
         ),

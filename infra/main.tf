@@ -162,6 +162,14 @@ data "aws_iam_policy_document" "server" {
     resources = [aws_s3_bucket.media.arn]
   }
 
+  # Notas de voz: API síncrona de Amazon Transcribe (el audio va en la petición;
+  # no usa S3 ni trabajos en cola). Proveedor intercambiable: app/core/transcription.py.
+  statement {
+    sid       = "TranscribeVoiceNotes"
+    actions   = ["transcribe:TranscribeAudio"]
+    resources = ["*"]
+  }
+
   # Avisos al asesor: solo desde la identidad verificada.
   statement {
     sid       = "SendNotifications"

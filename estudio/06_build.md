@@ -29,10 +29,11 @@ Demo para el curso: **escribirle por WhatsApp a annie, desplegada en AWS, como s
 | B11 | Tests de aislamiento entre clientes del mismo negocio (I3) | Bloque 5 | Validación |
 | B12 | Alertas de consumo (hoy solo un log) | Bloque 5 | Loop de control |
 | B13 | Resumen de memoria del cliente (perezoso, al volver) | Bloque 4 | Memoria |
-| B14 | Transcripción de notas de voz (Amazon Transcribe) | Bloque 4 | Contexto |
+| B14 | Transcripción de notas de voz (Amazon Transcribe) | Bloque 4 | Contexto · **Hecho el 2026-11-25, sin commit**: módulo intercambiable (`app/core/transcription.py`, interfaz `Transcriber`; proveedor por `TRANSCRIPTION_PROVIDER`). Amazon con la API síncrona `TranscribeAudio` ($0,007/min). El audio entra a la ráfaga, se transcribe en paralelo a la espera y no se guarda (solo el texto). Tope de 2 min. Probado con una nota de voz real (Ogg/Opus, 6,38 s): el archivo y el tope funcionan, pero **Amazon Transcribe no está en el plan gratuito de AWS** (SubscriptionRequiredException). Decisión de Thomas (2026-11-25): por ahora queda así; evaluar proveedores con prueba gratuita y, si no, el MVP va sin audios (annie le pide al cliente que lo escriba) |
 | B15 | Métricas del embudo + resultado del lead (`vendido` / `perdido`) | Bloque 2 | — |
 | B16 | Dockerfile + despliegue en AWS + HTTPS | Bloque 7 | — · **Escrito el 2026-11-24** (`Dockerfile`, `infra/`, `deploy/deploy.ps1`). Las plantillas del servidor están revisadas; falta `terraform validate` y probar el build |
 | B17 | App de Meta: número de prueba, token, webhook | Bloque 7 | — |
+| B18 | Indicador "escribiendo…" mientras annie espera la ráfaga y responde | Prueba final (2026-11-25) | Loop de control · **Hecho el 2026-11-25, sin commit**: solo lo dispara `_responder` (una petición por respuesta, nunca por mensaje; nada en modo humano). Antes: la Cloud API lo permite (`POST /<phone_number_id>/messages` con `status: "read"`, `message_id` del mensaje entrante y `typing_indicator: {"type": "text"}`). La misma llamada marca el mensaje como leído (palomitas azules). Dura hasta 25 s o hasta que se envía la respuesta. Meta recomienda mostrarlo solo si de verdad se va a responder: no en modo humano. Con 10 s de espera + modelo cabe; si hay reintento de la guardia, habría que reenviarlo |
 
 ## Decisiones pendientes antes de construir
 

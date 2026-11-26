@@ -204,7 +204,7 @@ def test_mensajes_distintos_se_procesan_ambos(
 def test_tipo_no_soportado_responde_amable(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, negocio_whatsapp: UUID
 ) -> None:
-    """Un audio no se procesa, pero el cliente no queda sin respuesta."""
+    """Una ubicación no se procesa, pero el cliente no queda sin respuesta."""
     enviados: list[str] = []
 
     async def fake_send(msg: Any, **kwargs: Any) -> list[str]:
@@ -215,7 +215,9 @@ def test_tipo_no_soportado_responde_amable(
 
     r = _post(
         client,
-        _payload_texto(tipo="audio", message_id="wamid.AUDIO1", phone_number_id=PHONE_NUMBER_ID),
+        _payload_texto(
+            tipo="location", message_id="wamid.UBICACION1", phone_number_id=PHONE_NUMBER_ID
+        ),
     )
 
     assert r.status_code == 200

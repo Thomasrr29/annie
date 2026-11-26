@@ -79,6 +79,17 @@ st.html(
         transition: background-color 120ms ease-out;
       }
       [class*="st-key-item-"]:hover { background: rgba(128, 128, 128, 0.08); }
+
+      /* Toda la fila abre la conversación, no solo el nombre: el botón del nombre
+         se "estira" con un pseudo-elemento que cubre la fila completa (técnica
+         de enlace estirado). Por eso la fila es la única con posición relativa. */
+      [class*="st-key-item-"] { position: relative; cursor: pointer; }
+      [class*="st-key-item-"] [data-testid="stElementContainer"],
+      [class*="st-key-item-"] [data-testid="stButton"],
+      [class*="st-key-item-"] button { position: static; }
+      [class*="st-key-item-"] button::after {
+        content: ""; position: absolute; inset: 0; border-radius: 10px; z-index: 1;
+      }
       [class*="st-key-item-sel-"] {
         background: rgba(128, 128, 128, 0.16);
         box-shadow: inset 3px 0 0 rgba(128, 128, 128, 0.7);
@@ -87,9 +98,16 @@ st.html(
         justify-content: flex-start; padding: 0; min-height: 0; width: 100%;
       }
       [class*="st-key-item-"] button > div { justify-content: flex-start; }
-      [class*="st-key-item-"] button p { font-weight: 600; text-align: left; }
+      /* Cada línea de la fila en UNA línea, con "…" si no cabe: el nombre, las
+         etiquetas con la hora y la vista previa. Sin esto, en una columna
+         angosta todo se partía en 4 o 5 renglones. */
+      [class*="st-key-item-"] button p {
+        font-weight: 600; text-align: left;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
       [class*="st-key-item-"] [data-testid="stCaptionContainer"] p {
-        margin: 0; line-height: 1.45;
+        margin: 0; line-height: 1.6;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
     </style>
     """
@@ -152,6 +170,14 @@ def _nombre(cliente: dict[str, Any]) -> str:
     return str(cliente.get("display_name") or cliente.get("channel_identifier") or "Cliente")
 
 
+ESTADOS_AUDIO = {
+    "done": "🎤 Nota de voz (transcripción automática)",
+    "pending": "🎤 Nota de voz · transcribiendo…",
+    "failed": "🎤 Nota de voz · no se pudo transcribir",
+    "too_long": "🎤 Nota de voz · más de 2 minutos, no se transcribió",
+}
+
+
 def _vista_previa(ultimo: dict[str, Any] | None) -> str:
     """Ultimo mensaje en una linea, ya escapado para markdown."""
     if not ultimo:
@@ -159,6 +185,8 @@ def _vista_previa(ultimo: dict[str, Any] | None) -> str:
     prefijo = {"agent": "Agente: ", "human": "Vos: "}.get(str(ultimo.get("role")), "")
     if ultimo.get("content_type") == "image":
         cuerpo = "📷 Foto" + (f" · {ultimo['content']}" if ultimo.get("content") else "")
+    elif ultimo.get("content_type") == "audio":
+        cuerpo = "🎤 Nota de voz" + (f" · {ultimo['content']}" if ultimo.get("content") else "")
     else:
         cuerpo = str(ultimo.get("content") or "")
     cuerpo = cuerpo.replace("\n", " ")
@@ -283,6 +311,10 @@ def chat(conversation_id: str) -> None:
                         st.image(datos, width=280)
                     else:
                         st.caption("📷 Imagen no disponible")
+                if m.get("content_type") == "audio":
+                    # El audio no se guarda (Ley 1581): solo su transcripción.
+                    estado = str(m.get("transcription_status"))
+                    st.caption(ESTADOS_AUDIO.get(estado, "🎤 Nota de voz"))
                 if m.get("content"):
                     st.markdown(_texto_literal(str(m["content"])))
 
@@ -410,13 +442,18 @@ def _cambiar_estado(conversation_id: str, estado: str) -> None:
 # ----------------------------------------------------------------------
 # Pagina
 # ----------------------------------------------------------------------
-col_lista, col_chat, col_ficha = st.columns([1.2, 2.6, 1.1], gap="large")
+seleccion = st.session_state.get(SELECCION_KEY)
+
+# Sin conversación abierta no hace falta la ficha: la lista toma más espacio.
+if seleccion:
+    col_lista, col_chat, col_ficha = st.columns([1.5, 2.6, 1.0], gap="medium")
+else:
+    col_lista, col_chat = st.columns([2.2, 2.8], gap="medium")
 
 with col_lista:
     _etiqueta("Conversaciones")
     lista_de_conversaciones()
 
-seleccion = st.session_state.get(SELECCION_KEY)
 if not seleccion:
     col_chat.info("Elegí una conversación de la lista.")
     st.stop()
