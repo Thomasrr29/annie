@@ -22,7 +22,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from app.db.repositories import AgentRepo
+from app.db.repositories import AgentRepo, CatalogRepo
 from app.db.session import dispose_engine, set_tenant, system_session
 
 # Id fijo del negocio demo: estable entre corridas.
@@ -36,11 +36,9 @@ DEMO_KNOWLEDGE: list[tuple[str, str]] = [
         "Domingos y festivos permanecemos cerrados.",
     ),
     (
-        "Servicios y precios",
-        "Corte de cabello: $30.000\n"
-        "Tinte completo: $90.000\n"
-        "Peinado para evento: $60.000\n"
-        "Los precios incluyen lavado y secado.",
+        "Servicios",
+        "Hacemos corte de cabello, tinte completo y peinado para evento.\n"
+        "Todos los servicios incluyen lavado y secado.",
     ),
     (
         "Ubicación y contacto",
@@ -53,6 +51,16 @@ DEMO_KNOWLEDGE: list[tuple[str, str]] = [
         "Si necesitás cancelar, avisanos con al menos 4 horas de anticipación.",
     ),
 ]
+
+# Lo que vende el negocio y su precio (tabla catalog_items, migración 0012).
+# Los precios NO van en el texto del conocimiento: el modelo los cita por
+# referencia y el sistema pone el número (app/core/catalog.py).
+DEMO_CATALOG: list[tuple[str, int]] = [
+    ("Corte de cabello", 30_000),
+    ("Tinte completo", 90_000),
+    ("Peinado para evento", 60_000),
+]
+
 
 class DemoAgent(NamedTuple):
     """Definicion de un agente demo (tipada, para no perder el chequeo)."""
@@ -177,6 +185,10 @@ async def seed(reset: bool = False) -> None:
                 {"bid": DEMO_BUSINESS_ID, "titulo": titulo, "contenido": contenido},
             )
 
+        catalogo = CatalogRepo(session)
+        for nombre, precio in DEMO_CATALOG:
+            await catalogo.create(DEMO_BUSINESS_ID, nombre, precio)
+
         # Los agentes van por el repositorio: es el mismo camino que usa el panel.
         agent_repo = AgentRepo(session)
         for agente in DEMO_AGENTS:
@@ -192,6 +204,7 @@ async def seed(reset: bool = False) -> None:
 
     print(f"Negocio demo creado: {DEMO_NAME} ({DEMO_BUSINESS_ID})")
     print(f"  - {len(DEMO_KNOWLEDGE)} documentos de conocimiento")
+    print(f"  - {len(DEMO_CATALOG)} ítems en el catálogo")
     print(f"  - {len(DEMO_AGENTS)} agentes: {', '.join(a.name for a in DEMO_AGENTS)}")
 
 

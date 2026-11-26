@@ -3,25 +3,44 @@ name = "agente-soporte-mvp"
 version = "0.1.0"
 description = "Plataforma SaaS multi-tenant de agentes conversacionales de soporte para pymes"
 requires-python = ">=3.12"
+# Rangos = lo que el proyecto acepta: desde la versión más vieja probada hasta
+# antes del siguiente "major". La versión EXACTA que se instala la fija
+# constraints.txt (pip install -c constraints.txt ...).
 dependencies = [
-    "fastapi>=0.115.0",
-    "uvicorn[standard]>=0.32.0",
-    "pydantic>=2.9.0",
-    "pydantic-settings>=2.6.0",
-    "sqlalchemy[asyncio]>=2.0.36",
-    "asyncpg>=0.30.0",
-    "alembic>=1.14.0",
-    "pgvector>=0.3.6",
-    "anthropic>=0.40.0",
-    "httpx>=0.27.0",
+    "fastapi>=0.140,<1",
+    "uvicorn[standard]>=0.51,<1",
+    "pydantic>=2.13,<3",
+    "pydantic-settings>=2.14,<3",
+    # <2.1: la 2.1 cambió los genéricos de Select (TypeVarTuple) y el código está
+    # tipado para la 2.0. Sin tope, el CI instalaba 2.1 y mypy fallaba mientras en
+    # local pasaba con 2.0. Migrar a 2.1 es una decisión aparte.
+    "sqlalchemy[asyncio]>=2.0.51,<2.1",
+    "asyncpg>=0.31,<1",
+    "alembic>=1.18,<2",
+    "pgvector>=0.5,<1",
+    "anthropic>=0.120,<3",
+    "httpx>=0.28,<1",
+    # SDK oficial de AWS: aviso al asesor por SES (RF-11) y, después, imágenes en S3.
+    # Es síncrono: se usa siempre dentro de asyncio.to_thread, nunca en el loop.
+    "boto3>=1.44,<2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.3.0",
-    "pytest-asyncio>=0.24.0",
-    "mypy>=1.13.0",
-    "ruff>=0.8.0",
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "mypy>=2.3,<3",
+    "ruff>=0.16,<1",
+]
+# Panel de administración (Streamlit). Es un extra y no una dependencia base
+# porque corre como proceso aparte y habla con la API por HTTP: el servidor de
+# producción no necesita instalarlo. pypdf/python-docx solo se usan para extraer
+# texto de los documentos que carga el dueño.
+panel = [
+    "streamlit>=1.60,<2",
+    "pandas>=3.0,<4",
+    "pypdf>=6.14,<8",
+    "python-docx>=1.2,<2",
 ]
 
 [build-system]
@@ -43,6 +62,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # FastAPI documentan para enums serializables. Mantener la forma del contrato.
 ignore = ["UP042"]
 
+[tool.ruff.lint.isort]
+# Los módulos del panel se importan por nombre plano: Streamlit pone el
+# directorio del script principal en sys.path, así que `panel/` no es un paquete.
+known-first-party = ["app", "scripts", "api_client", "extraccion", "sesion"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -50,7 +74,7 @@ plugins = ["pydantic.mypy"]
 exclude = ["migrations/", "app/scaffold_referencia.py"]
 
 [[tool.mypy.overrides]]
-module = ["pgvector.*", "asyncpg.*"]
+module = ["pgvector.*", "asyncpg.*", "streamlit.*", "pypdf.*", "docx.*", "pandas.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

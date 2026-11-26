@@ -1,0 +1,38 @@
+[
+  {
+    "name": "Nott Tired",
+    "price": 39900
+  },
+  {
+    "name": "Nott Sick",
+    "price": 39900
+  },
+  {
+    "name": "Nott Stressed",
+    "price": 39900
+  },
+  {
+    "name": "Nott Guilty",
+    "price": 24900
+  },
+  {
+    "name": "Nott Shy",
+    "price": 14900
+  },
+  {
+    "name": "Nott Hungry",
+    "price": 29900
+  },
+  {
+    "name": "Plan Nott Basic (mensual)",
+    "price": 59900
+  },
+  {
+    "name": "Plan Nott Average (mensual)",
+    "price": 79900
+  },
+  {
+    "name": "Plan Nott Stopping (mensual)",
+    "price": 109900
+  }
+]

@@ -26,7 +26,13 @@ from uuid import UUID
 import httpx
 
 from app.config import settings
-from app.schemas import InboundMessage, OutboundMessage
+from app.schemas import (
+    ContentType,
+    InboundMedia,
+    InboundMessage,
+    OutboundMessage,
+    text_for_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +46,17 @@ WHATSAPP_MAX_TEXT_LEN: Final = 4096
 SEND_MAX_ATTEMPTS: Final = 3
 SEND_BACKOFF_SECONDS: Final = (0.5, 2.0)
 
+# WhatsApp limita el pie de foto a 1024 caracteres.
+WHATSAPP_MAX_CAPTION_LEN: Final = 1024
+
+# Imagenes: los formatos y el tope que acepta WhatsApp. Se aplican igual a lo
+# que entra (descarga) y a lo que sale (subida desde el panel).
+IMAGE_MIME_TYPES: Final = frozenset({"image/jpeg", "image/png", "image/webp"})
+MAX_IMAGE_BYTES: Final = 5 * 1024 * 1024
+
 # Respuesta cuando el cliente manda algo que no sabemos leer (audio, ubicacion...).
 UNSUPPORTED_TYPE_REPLY: Final = (
-    "Por ahora solo puedo leer mensajes de texto. "
+    "Por ahora solo puedo leer mensajes de texto y fotos. "
     "¿Me contás por escrito en qué te ayudo?"
 )
 
@@ -56,7 +70,7 @@ class SignatureError(WhatsAppError):
 
 
 class UnsupportedMessageType(WhatsAppError):
-    """Mensaje de un tipo que el MVP no procesa (audio, imagen, ubicacion...)."""
+    """Mensaje de un tipo que el MVP no procesa (audio, ubicacion, documento...)."""
 
     def __init__(self, message_type: str, sender: str, phone_number_id: str) -> None:
         super().__init__(f"tipo de mensaje no soportado: {message_type}")
@@ -67,6 +81,10 @@ class UnsupportedMessageType(WhatsAppError):
 
 class UnknownTenant(WhatsAppError):
     """El phone_number_id del payload no corresponde a ningun negocio."""
+
+
+class InvalidMedia(WhatsAppError):
+    """Archivo con formato o tamaño que WhatsApp (o nosotros) no aceptamos."""
 
 
 # ======================================================================
@@ -143,8 +161,12 @@ def adapt_whatsapp_payload(payload: dict[str, Any], business_id: UUID) -> Inboun
     El `business_id` llega ya resuelto (lo hace el webhook con
     `extract_phone_number_id`): este adaptador no toca la base de datos.
 
-    Lanza `UnsupportedMessageType` si el mensaje no es de texto, para que el
-    llamador pueda responder con amabilidad en vez de quedarse callado.
+    Texto, imagen y audio se procesan. Imagen y audio llegan como referencia
+    (`media`): el archivo se descarga despues, en segundo plano, con
+    `download_whatsapp_media`.
+
+    Lanza `UnsupportedMessageType` para cualquier otro tipo, para que el llamador
+    pueda responder con amabilidad en vez de quedarse callado.
     """
     try:
         value = payload["entry"][0]["changes"][0]["value"]
@@ -159,12 +181,36 @@ def adapt_whatsapp_payload(payload: dict[str, Any], business_id: UUID) -> Inboun
     message_type = str(message.get("type", "unknown"))
     phone_number_id = extract_phone_number_id(payload) or ""
 
-    if message_type != "text":
+    media: InboundMedia | None = None
+    if message_type == "text":
+        text = str((message.get("text") or {}).get("body", "")).strip()
+        if not text:
+            raise WhatsAppError("mensaje de texto vacio")
+    elif message_type == "image":
+        imagen = message.get("image") or {}
+        if not imagen.get("id"):
+            raise WhatsAppError("imagen sin id de media")
+        media = InboundMedia(
+            content_type=ContentType.IMAGE,
+            external_media_id=str(imagen["id"]),
+            mime_type=str(imagen.get("mime_type") or "image/jpeg"),
+            caption=str(imagen.get("caption") or "").strip(),
+        )
+        text = text_for_model(ContentType.IMAGE, media.caption)
+    elif message_type == "audio":
+        # Nota de voz (voice=true) o archivo de audio: entra al flujo como un
+        # mensaje más y se transcribe después (app/core/transcription.py).
+        audio = message.get("audio") or {}
+        if not audio.get("id"):
+            raise WhatsAppError("audio sin id de media")
+        media = InboundMedia(
+            content_type=ContentType.AUDIO,
+            external_media_id=str(audio["id"]),
+            mime_type=str(audio.get("mime_type") or "audio/ogg"),
+        )
+        text = text_for_model(ContentType.AUDIO, "", "pending")
+    else:
         raise UnsupportedMessageType(message_type, sender, phone_number_id)
-
-    text = str((message.get("text") or {}).get("body", "")).strip()
-    if not text:
-        raise WhatsAppError("mensaje de texto vacio")
 
     # `timestamp` viene en segundos epoch como string.
     raw_ts = message.get("timestamp")
@@ -186,6 +232,7 @@ def adapt_whatsapp_payload(payload: dict[str, Any], business_id: UUID) -> Inboun
         external_message_id=str(message.get("id")) if message.get("id") else None,
         received_at=received_at,
         display_name=display_name,
+        media=media,
     )
 
 
@@ -245,6 +292,172 @@ async def send_whatsapp_reply(
     return enviados
 
 
+async def send_typing_indicator(message_id: str, phone_number_id: str | None = None) -> None:
+    """
+    Muestra "escribiendo…" al cliente y marca su mensaje como leído (palomitas
+    azules). En un chat 1:1, marcar un mensaje también marca los anteriores.
+
+    `message_id` es el id que Meta le puso al mensaje del cliente (el "wamid"
+    que llega en el webhook, `InboundMessage.external_message_id`).
+
+    Meta lo quita cuando llega la respuesta o a los 25 s. Es cosmético: UN
+    intento, timeout corto y sin reintentos (reintentar solo sumaría peticiones).
+    Docs: https://developers.facebook.com/docs/whatsapp/cloud-api/typing-indicators/
+    """
+    number_id = phone_number_id or settings.whatsapp_phone_number_id
+    url = f"{GRAPH_API_BASE}/{GRAPH_API_VERSION}/{number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {settings.whatsapp_access_token}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": message_id,
+        "typing_indicator": {"type": "text"},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(url, headers=headers, json=body)
+    except httpx.HTTPError as exc:
+        raise WhatsAppError(f"no se pudo mostrar 'escribiendo': {exc}") from exc
+    if response.status_code >= 400:
+        raise WhatsAppError(
+            f"WhatsApp rechazo el indicador ({response.status_code}): {response.text}"
+        )
+
+
+# ======================================================================
+# Imagenes: descarga (entrada) y subida + envio (salida)
+# ======================================================================
+def check_image(data: bytes, mime_type: str) -> None:
+    """
+    Valida una imagen contra lo que acepta WhatsApp. Lanza `InvalidMedia`.
+
+    Se aplica en los dos sentidos: lo que se descarga se guarda en la base, asi
+    que un archivo enorme o de otro tipo no debe entrar aunque Meta lo entregue.
+    """
+    if mime_type not in IMAGE_MIME_TYPES:
+        raise InvalidMedia(f"formato de imagen no soportado: {mime_type}")
+    if not data:
+        raise InvalidMedia("imagen vacia")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise InvalidMedia(
+            f"imagen de {len(data) // 1024} KB; el maximo es {MAX_IMAGE_BYTES // 1024} KB"
+        )
+
+
+# WhatsApp acepta audios de hasta 16 MB.
+MAX_AUDIO_BYTES: Final = 16 * 1024 * 1024
+
+
+async def download_whatsapp_media(
+    media_id: str, *, audio: bool = False
+) -> tuple[bytes, str]:
+    """
+    Descarga un archivo que mando el cliente. Devuelve (bytes, mime_type).
+
+    Son dos pasos: `GET /{media_id}` devuelve una URL temporal, y esa URL se baja
+    con el mismo token. La URL expira en minutos, por eso se descarga apenas
+    llega el mensaje y no cuando alguien abre la bandeja.
+    """
+    headers = {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            meta = await client.get(
+                f"{GRAPH_API_BASE}/{GRAPH_API_VERSION}/{media_id}", headers=headers
+            )
+            if meta.status_code >= 400:
+                raise WhatsAppError(
+                    f"no se pudo resolver la media {media_id} ({meta.status_code})"
+                )
+            info = meta.json()
+            url = info.get("url")
+            if not url:
+                raise WhatsAppError(f"la media {media_id} no trae url de descarga")
+
+            # Se rechaza ANTES de bajar si Meta ya avisa que es demasiado grande.
+            declarado = int(info.get("file_size") or 0)
+            maximo = MAX_AUDIO_BYTES if audio else MAX_IMAGE_BYTES
+            if declarado > maximo:
+                raise InvalidMedia(f"archivo de {declarado // 1024} KB, supera el maximo")
+
+            archivo = await client.get(str(url), headers=headers)
+            if archivo.status_code >= 400:
+                raise WhatsAppError(
+                    f"no se pudo descargar la media {media_id} ({archivo.status_code})"
+                )
+        except httpx.HTTPError as exc:
+            raise WhatsAppError(f"error de red al descargar la media: {exc}") from exc
+
+    mime_type = str(info.get("mime_type") or archivo.headers.get("content-type") or "")
+    if audio:
+        # Se conserva el mime completo ("audio/ogg; codecs=opus"): lo usa el
+        # proveedor de transcripcion. El audio no se guarda en ningun lado.
+        if not archivo.content:
+            raise InvalidMedia("audio vacio")
+        return archivo.content, mime_type
+    mime_type = mime_type.split(";")[0].strip()
+    check_image(archivo.content, mime_type)
+    return archivo.content, mime_type
+
+
+async def send_whatsapp_image(
+    to: str,
+    data: bytes,
+    mime_type: str,
+    caption: str = "",
+    phone_number_id: str | None = None,
+) -> str:
+    """
+    Sube una imagen a Meta y la envia. Devuelve el id del mensaje.
+
+    Se sube primero (`POST /{phone_number_id}/media`) y se envia por id, en vez de
+    pasar un link publico: los archivos del negocio no tienen URL publica y no
+    deben tenerla.
+    """
+    check_image(data, mime_type)
+    number_id = phone_number_id or settings.whatsapp_phone_number_id
+    auth = {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            subida = await client.post(
+                f"{GRAPH_API_BASE}/{GRAPH_API_VERSION}/{number_id}/media",
+                headers=auth,
+                data={"messaging_product": "whatsapp", "type": mime_type},
+                files={"file": ("imagen", data, mime_type)},
+            )
+        except httpx.HTTPError as exc:
+            raise WhatsAppError(f"error de red al subir la imagen: {exc}") from exc
+
+        if subida.status_code >= 400:
+            raise WhatsAppError(
+                f"WhatsApp rechazo la imagen ({subida.status_code}): {subida.text}"
+            )
+        media_id = subida.json().get("id")
+        if not media_id:
+            raise WhatsAppError("WhatsApp no devolvio el id de la imagen subida")
+
+        imagen: dict[str, Any] = {"id": str(media_id)}
+        if caption.strip():
+            imagen["caption"] = caption.strip()[:WHATSAPP_MAX_CAPTION_LEN]
+
+        body = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "image",
+            "image": imagen,
+        }
+        return await _post_with_retry(
+            client,
+            f"{GRAPH_API_BASE}/{GRAPH_API_VERSION}/{number_id}/messages",
+            {**auth, "Content-Type": "application/json"},
+            body,
+        )
+
+
 async def _post_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -292,14 +505,22 @@ async def _post_with_retry(
 
 
 __all__ = [
+    "IMAGE_MIME_TYPES",
+    "MAX_AUDIO_BYTES",
+    "MAX_IMAGE_BYTES",
     "UNSUPPORTED_TYPE_REPLY",
+    "InvalidMedia",
     "SignatureError",
     "UnknownTenant",
     "UnsupportedMessageType",
     "WhatsAppError",
     "adapt_whatsapp_payload",
+    "check_image",
+    "download_whatsapp_media",
     "extract_phone_number_id",
     "is_status_update",
+    "send_whatsapp_image",
+    "send_typing_indicator",
     "send_whatsapp_reply",
     "verify_subscription",
     "verify_webhook_signature",

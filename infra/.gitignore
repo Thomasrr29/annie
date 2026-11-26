@@ -1,0 +1,11 @@
+# Estado de Terraform: contiene secretos (contraseñas generadas). Nunca al repo.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Variables locales (correo, dominio)
+terraform.tfvars
+*.auto.tfvars
+
+# El lock de proveedores SÍ se versiona (.terraform.lock.hcl)

@@ -53,6 +53,17 @@ if _IN_CI and not TEST_DATABASE_URL:
         "Configurar DATABASE_URL apuntando a la Postgres del pipeline."
     )
 
+@pytest.fixture(autouse=True)
+def _sin_espera_de_rafaga(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    En los tests el turno no espera los 10 s de ráfaga (invariante I2): cada
+    test que quiera probar la espera la activa con un valor chico.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "turn_debounce_seconds", 0.0)
+
+
 requires_db = pytest.mark.skipif(
     not TEST_DATABASE_URL,
     reason="Sin TEST_DATABASE_URL/DATABASE_URL: se requiere Postgres con las migraciones aplicadas",

@@ -18,6 +18,8 @@ import logging
 from typing import Any, Final
 from uuid import UUID
 
+from app.config import settings
+from app.core import email_ses
 from app.db.repositories import BusinessRepo, RequestRepo
 from app.db.session import tenant_session
 from app.schemas import KnowledgeHit
@@ -115,13 +117,45 @@ async def capture_request(
     return f"Solicitud registrada con el número {str(solicitud_id)[:8]}."
 
 
+AVISO_ENVIADO: Final = "Listo, le avisé al negocio."
+AVISO_SOLO_PANEL: Final = (
+    "No pude enviar el aviso, pero la solicitud quedó registrada en el panel del negocio."
+)
+
+
+def _clean_subject(subject: str) -> str:
+    """Una sola línea y corta: el asunto puede venir del modelo."""
+    limpio = " ".join(subject.split())
+    return (limpio or "Nueva solicitud")[:150]
+
+
+def _compose_email(business_name: str, subject: str, body: str) -> tuple[str, str]:
+    """
+    Arma el correo para el asesor.
+
+    El marco lo pone el SISTEMA (de qué negocio es, dónde responder); el texto del
+    modelo va marcado como resumen automático, para que el asesor lo verifique en
+    la conversación antes de actuar ("lo que ve la persona sale del sistema").
+    """
+    asunto = f"[{business_name}] {_clean_subject(subject)}"
+    cuerpo = (
+        f"{body.strip()}\n\n"
+        "—\n"
+        f"Aviso automático de annie para {business_name}.\n"
+        "El texto de arriba lo resume el asistente: verificalo en la conversación.\n"
+        f"Responder desde el panel: {settings.api_base_url.rstrip('/')}/panel\n"
+    )
+    return asunto, cuerpo
+
+
 async def notify_owner(business_id: UUID, subject: str, body: str) -> str:
     """
-    RF-11. R: businesses.notify_config; envio por el medio configurado.
+    RF-11. R: businesses.notify_config; envío por el medio configurado.
 
-    El envio real (email/WhatsApp del dueño) queda para la fase 7: hoy se
-    registra la intencion, que es lo que necesita el circuito. Devuelve texto
-    para el modelo, no lanza: un aviso fallido no debe romper la conversacion.
+    Canal soportado: `email` (Amazon SES), con `notify_config = {"email": "..."}`.
+    Devuelve texto para el modelo y NUNCA lanza: un aviso fallido no debe romper
+    la conversación (RNF-10). La solicitud o el escalamiento ya quedaron en la
+    base, así que el panel los muestra aunque el correo falle.
     """
     async with tenant_session(business_id) as session:
         config = await BusinessRepo(session).get_notify_config(business_id)
@@ -129,13 +163,25 @@ async def notify_owner(business_id: UUID, subject: str, body: str) -> str:
     canal = config.get("channel")
     if not canal:
         logger.warning("negocio %s sin canal de notificacion configurado", business_id)
-        return "No hay un canal de aviso configurado; la solicitud quedó registrada igual."
+        return AVISO_SOLO_PANEL
 
-    # TODO(fase 7): envio real por email/WhatsApp segun `canal`.
-    logger.info(
-        "aviso al dueño (%s) del negocio %s: %s | %s", canal, business_id, subject, body[:200]
-    )
-    return "Listo, le avisé al negocio."
+    if canal != "email":
+        logger.warning("canal de aviso %r no soportado (negocio %s)", canal, business_id)
+        return AVISO_SOLO_PANEL
+
+    destino = (config.get("config") or {}).get("email")
+    if not destino:
+        logger.warning("negocio %s con canal email pero sin direccion", business_id)
+        return AVISO_SOLO_PANEL
+
+    asunto, cuerpo = _compose_email(str(config.get("name") or "annie"), subject, body)
+    try:
+        await email_ses.send_email(str(destino), asunto, cuerpo)
+    except email_ses.EmailError:
+        logger.exception("no se pudo enviar el aviso por correo (negocio %s)", business_id)
+        return AVISO_SOLO_PANEL
+
+    return AVISO_ENVIADO
 
 
 async def search_knowledge(

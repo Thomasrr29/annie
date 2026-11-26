@@ -387,7 +387,13 @@ def test_el_sandbox_responde_sin_tocar_whatsapp(
 
     assert r.status_code == 200
     datos = r.json()
-    assert datos["reply_text"] == "Atendemos de 8 a 18."
+    # El sandbox muestra EXACTAMENTE lo que recibiría el cliente: en el primer
+    # contacto, la respuesta va seguida del aviso de privacidad (Ley 1581).
+    from app.core.limits import AVISO_PRIVACIDAD
+
+    assert datos["reply_text"].startswith("Atendemos de 8 a 18.")
+    assert AVISO_PRIVACIDAD in datos["reply_text"]
+    assert datos["replied"] is True
     assert datos["detected_intent"] == "inform"
     assert datos["routed_agent"] == "Informador"
     assert enviados == [], "el sandbox no debe enviar nada por WhatsApp"
@@ -421,3 +427,99 @@ def test_el_sandbox_expone_la_traza_para_depurar(
     assert r["detected_intent"] == "greet"
     assert r["cache_read_tokens"] == 100
     assert r["latency_ms"] is not None
+
+
+def test_el_sandbox_dice_cuando_el_agente_no_responde(
+    client: TestClient, tenant_a: Tenant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    En modo humano el agente calla. El sandbox no debe mostrar el mensaje del
+    propio cliente como si fuera la respuesta, ni la traza del turno anterior
+    ("en un agente se evalúa el camino": la traza tiene que ser la verdadera).
+    """
+    from app.core.llm import ClassifyResult
+    from app.schemas import Intent, TurnUsage
+
+    llamadas_al_modelo: list[str] = []
+
+    async def fake_classify(*args: Any, **kwargs: Any) -> ClassifyResult:
+        llamadas_al_modelo.append("classify")
+        return ClassifyResult(intent=Intent.ESCALATE, usage=TurnUsage(model_calls=1))
+
+    monkeypatch.setattr("app.core.orchestrator.classify", fake_classify)
+
+    cliente = {"customer_identifier": "sandbox-modo-humano"}
+
+    escalado = client.post(
+        "/admin/sandbox/message",
+        headers=tenant_a.headers,
+        json={"text": "necesito hablar con una persona", **cliente},
+    ).json()
+    assert escalado["replied"] is True
+    assert escalado["detected_intent"] == "escalate"
+
+    silencio = client.post(
+        "/admin/sandbox/message",
+        headers=tenant_a.headers,
+        json={"text": "quiero agendar para el viernes", **cliente},
+    ).json()
+
+    assert silencio["replied"] is False
+    assert silencio["outcome"] == "modo_humano"
+    assert silencio["reply_text"] == ""
+    assert "modo humano" in silencio["no_reply_reason"]
+    # La traza es la de ESTE mensaje: no hubo turno del modelo.
+    assert silencio["detected_intent"] is None
+    assert silencio["input_tokens"] == 0
+    assert llamadas_al_modelo == ["classify"], "en modo humano no se llama al modelo"
+
+
+
+# ======================================================================
+# Catálogo (migración 0012)
+# ======================================================================
+def test_catalogo_crud(client: TestClient, tenant_a: Tenant) -> None:
+    creado = client.post(
+        "/admin/catalog", headers=tenant_a.headers, json={"name": "Tinte completo", "price": 90000}
+    )
+    assert creado.status_code == 201
+    item = creado.json()
+    assert item["price"] == 90000 and item["status"] == "active"
+
+    lista = client.get("/admin/catalog", headers=tenant_a.headers).json()
+    assert [i["name"] for i in lista] == ["Tinte completo"]
+
+    editado = client.patch(
+        f"/admin/catalog/{item['id']}", headers=tenant_a.headers, json={"price": 95000}
+    )
+    assert editado.status_code == 200 and editado.json()["price"] == 95000
+
+    borrado = client.delete(f"/admin/catalog/{item['id']}", headers=tenant_a.headers)
+    assert borrado.status_code == 204
+    assert client.get("/admin/catalog", headers=tenant_a.headers).json() == []
+
+
+def test_catalogo_rechaza_nombres_repetidos_y_precios_negativos(
+    client: TestClient, tenant_a: Tenant
+) -> None:
+    cuerpo = {"name": "Corte", "price": 30000}
+    assert client.post("/admin/catalog", headers=tenant_a.headers, json=cuerpo).status_code == 201
+    assert client.post("/admin/catalog", headers=tenant_a.headers, json=cuerpo).status_code == 409
+    negativo = {"name": "Otro", "price": -1}
+    assert client.post("/admin/catalog", headers=tenant_a.headers, json=negativo).status_code == 422
+
+
+def test_catalogo_de_otro_negocio_no_se_ve_ni_se_edita(
+    client: TestClient, tenant_a: Tenant, tenant_b: Tenant
+) -> None:
+    item = client.post(
+        "/admin/catalog", headers=tenant_a.headers, json={"name": "Secreto A", "price": 1}
+    ).json()
+
+    assert client.get("/admin/catalog", headers=tenant_b.headers).json() == []
+    ajeno = client.patch(
+        f"/admin/catalog/{item['id']}", headers=tenant_b.headers, json={"price": 0}
+    )
+    assert ajeno.status_code == 404
+    borrado_ajeno = client.delete(f"/admin/catalog/{item['id']}", headers=tenant_b.headers)
+    assert borrado_ajeno.status_code == 404

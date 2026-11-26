@@ -33,7 +33,9 @@ from anthropic import (
 )
 
 from app.config import settings
+from app.core.catalog import prompt_section as catalog_prompt_section
 from app.schemas import (
+    IMAGE_PLACEHOLDER,
     AgentConfig,
     BusinessConfig,
     ConversationContext,
@@ -46,14 +48,20 @@ logger = logging.getLogger(__name__)
 
 # Precios por millon de tokens (USD). En settings, no hardcodeados en la logica:
 # los modelos y sus precios rotan.
+# Haiku 4.5 y Sonnet 5.5 (2026-10). cache_write es la escritura de 5 minutos.
 PRICING: Final[dict[str, dict[str, float]]] = {
-    "haiku": {"input": 0.80, "output": 4.00, "cache_read": 0.08, "cache_write": 1.00},
-    "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
+    "haiku": {"input": 1.00, "output": 5.00, "cache_read": 0.10, "cache_write": 1.25},
+    "sonnet": {"input": 2.00, "output": 10.00, "cache_read": 0.20, "cache_write": 2.50},
 }
 
 MAX_TOOL_ITERATIONS: Final = 5
 CLASSIFY_MAX_TOKENS: Final = 256
-RESPOND_MAX_TOKENS: Final = 1024
+# Sonnet 5.5 piensa por defecto (adaptive) y ese razonamiento cuenta contra
+# max_tokens: con 1024 una respuesta podia cortarse a la mitad.
+RESPOND_MAX_TOKENS: Final = 4096
+# Chat de soporte: respuestas cortas y sensibles a la latencia. `low` mantiene
+# el razonamiento breve; subirlo solo si se mide que la calidad lo pide.
+RESPOND_EFFORT: Final = "low"
 LLM_MAX_ATTEMPTS: Final = 2
 
 
@@ -181,12 +189,38 @@ def build_system_prefix(
             f"{business.knowledge_context}"
         )
 
+    if business.catalog:
+        # Precios por referencia: el modelo NO ve cifras, solo referencias. El
+        # sistema las reemplaza por el precio real (app/core/catalog.py).
+        partes.append(
+            "\n## Productos y servicios (precios)\n"
+            "Esto es lo que vende el negocio. Para dar un precio escribí EXACTAMENTE "
+            "la referencia del ítem, por ejemplo «cuesta {{precio:clave}}»; el "
+            "sistema la reemplaza por el valor real antes de enviar el mensaje.\n"
+            "- NUNCA escribas un precio con números: siempre la referencia.\n"
+            "- Usá la referencia del ítem por el que pregunta el cliente, no otra.\n"
+            "- En tus mensajes anteriores de esta conversación vas a ver los precios "
+            "ya con números: los puso el sistema al reemplazar tus referencias, y "
+            "son correctos. No los corrijas, no aclares nada sobre ellos ni te "
+            "disculpes. Si tenés que repetir un precio, usá de nuevo la referencia.\n"
+            "- Si lo que pide no está en esta lista, no tiene precio: decilo y "
+            "ofrecé pasar con una persona.\n\n"
+            f"{catalog_prompt_section(business.catalog)}"
+        )
+
     partes.append(
         "\n## Reglas generales\n"
         f"- Respondé en {business.language}, salvo que el cliente escriba en otro idioma.\n"
         "- Estás en WhatsApp: mensajes breves, sin markdown pesado.\n"
         "- Nunca inventes precios, horarios, disponibilidad ni promociones.\n"
-        "- Si no podés resolver algo, ofrecé escalar a una persona del negocio."
+        "- Si no podés resolver algo, ofrecé escalar a una persona del negocio.\n"
+        "- Las notas de voz te llegan transcritas después de «[Nota de voz del "
+        "cliente, transcrita]»: respondelas como si las hubiera escrito. Si una nota "
+        "de voz no se pudo escuchar, respondé solo lo demás: el aviso sobre el audio "
+        "lo agrega el sistema. No adivines qué dijo.\n"
+        f"- Si ves «{IMAGE_PLACEHOLDER}», no podés ver la foto: no "
+        "describas ni supongas lo que muestra. Pedile que te cuente qué busca, u "
+        "ofrecé pasarlo con una persona del negocio que sí puede verla."
     )
 
     return [
@@ -363,13 +397,17 @@ async def run_agent_turn(
     tools_used: list[str] = []
     tool_results: list[dict[str, Any]] = []
 
+    # Un agente sin herramientas no manda el campo: `tools: null` es un 400.
+    extra: dict[str, Any] = {"tools": tools} if tools else {}
+
     for iteracion in range(MAX_TOOL_ITERATIONS):
         response = await _call_with_retry(
             model=model,
             max_tokens=RESPOND_MAX_TOKENS,
+            output_config={"effort": RESPOND_EFFORT},
             system=system,
             messages=messages,
-            tools=tools or None,
+            **extra,
         )
         usages.append(_usage_from_response(response, model))
 
@@ -385,8 +423,10 @@ async def run_agent_turn(
             logger.error("el modelo pidio una herramienta pero no hay ejecutor")
             break
 
-        # Se acumula el turno del assistant y los resultados de las herramientas.
-        messages.append({"role": "assistant", "content": _content_blocks(response)})
+        # Se acumula el turno del assistant TAL CUAL llego (bloques de thinking
+        # incluidos): Sonnet 5.5 rechaza o descarta el razonamiento si el turno se
+        # reenvia editado.
+        messages.append({"role": "assistant", "content": response.content})
         bloques_resultado: list[dict[str, Any]] = []
 
         for bloque in _tool_use_blocks(response):
@@ -438,7 +478,7 @@ def _first_text(response: Any) -> str:
 
 
 def _content_blocks(response: Any) -> list[dict[str, Any]]:
-    """Bloques de contenido en forma serializable, para reenviarlos."""
+    """Bloques de texto y tool_use como dicts (para leerlos, no para reenviarlos)."""
     bloques: list[dict[str, Any]] = []
     for bloque in getattr(response, "content", []) or []:
         tipo = getattr(bloque, "type", None)

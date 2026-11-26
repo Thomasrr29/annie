@@ -49,13 +49,22 @@ jobs:
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # Versiones exactas (constraints.txt): el CI prueba el mismo software
+          # que corre en Docker y en el PC. [panel] para que el test de
+          # extracción de documentos corra y no se salte.
+          pip install -c constraints.txt -e ".[dev,panel]"
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Tipos (mypy)
-        run: mypy app scripts
+        # El panel se chequea aparte con MYPYPATH: sus modulos se importan por
+        # nombre plano (Streamlit pone el directorio del script en sys.path).
+        # `panel/pages/` queda afuera: los nombres empiezan con digito para fijar
+        # el orden del menu y no son identificadores validos de modulo.
+        run: |
+          mypy app scripts
+          MYPYPATH=panel mypy panel/api_client.py panel/extraccion.py panel/sesion.py
 
       - name: Migraciones desde cero
         run: alembic upgrade head

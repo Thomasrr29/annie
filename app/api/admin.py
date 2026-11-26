@@ -9,27 +9,39 @@ conociendo los uuid: los repositorios filtran (capa 1) y RLS respalda (capa 2).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import logging
 import secrets
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.channel_whatsapp import WhatsAppError, send_whatsapp_reply
+from app.core.channel_whatsapp import (
+    InvalidMedia,
+    WhatsAppError,
+    check_image,
+    send_whatsapp_image,
+    send_whatsapp_reply,
+)
 from app.core.limits import eliminar_datos_cliente
 from app.core.tools import TOOL_SCHEMAS
 from app.db.models import Agent, Business, KnowledgeDocument, TurnLog
 from app.db.repositories import (
     AgentRepo,
     BusinessRepo,
+    CatalogRepo,
     ConversationRepo,
     CustomerRepo,
     EscalationRepo,
+    MediaRepo,
     MessageRepo,
     RequestRepo,
 )
@@ -37,6 +49,7 @@ from app.db.session import system_session, tenant_session
 from app.schemas import (
     AgentConfig,
     AgentCreate,
+    ContentType,
     ConversationStatus,
     MessageRole,
     OutboundMessage,
@@ -164,15 +177,40 @@ class HumanReply(BaseModel):
     return_to_auto: bool = False
 
 
+class ImageReply(BaseModel):
+    image_base64: str
+    mime_type: str
+    caption: str = ""
+    return_to_auto: bool = False
+
+
+class ConversationStatusChange(BaseModel):
+    status: ConversationStatus
+
+
 class SandboxMessage(BaseModel):
     text: str
     customer_identifier: str = "sandbox-tester"
 
 
 class SandboxResponse(BaseModel):
-    """Respuesta del sandbox, con detalle para depurar (HU-ADM-05)."""
+    """
+    Respuesta del sandbox, con detalle para depurar (HU-ADM-05).
+
+    `replied=False` significa que el agente NO contestó (por ejemplo, la
+    conversación está en modo humano): `reply_text` queda vacío y
+    `no_reply_reason` explica por qué. La traza (intención, tokens, costo) es la
+    de ESTE mensaje; si no se registró un turno, queda vacía en vez de mostrar
+    la del turno anterior.
+    """
 
     reply_text: str
+    replied: bool = True
+    outcome: str = "respondido"
+    # Id del mensaje del agente que se guardó: el panel lo usa para mostrar la
+    # traza junto al mensaje correcto del hilo.
+    reply_message_id: UUID | None = None
+    no_reply_reason: str | None = None
     detected_intent: str | None = None
     routed_agent: str | None = None
     tools_used: list[str] = Field(default_factory=list)
@@ -226,6 +264,19 @@ def _validar_herramientas(allowed_tools: list[str]) -> None:
                 f"Disponibles: {sorted(HERRAMIENTAS_VALIDAS)}"
             ),
         )
+
+
+@router.get("/tools")
+async def list_tools(business_id: BusinessId) -> list[str]:
+    """
+    Catalogo de herramientas validas para `allowed_tools`.
+
+    Existe para que el panel ofrezca exactamente lo que `_validar_herramientas`
+    acepta: si el panel tuviera su propia lista, las dos se separarian y el
+    dueno guardaria una herramienta que la API rechaza (o peor, dejaria de ver
+    una nueva).
+    """
+    return sorted(HERRAMIENTAS_VALIDAS)
 
 
 @router.get("/agents")
@@ -290,6 +341,79 @@ async def update_agent(
         agente = AgentConfig.model_validate(fila)
 
     return agente.model_dump(mode="json")
+
+
+# ======================================================================
+# Catálogo: lo que vende el negocio (migración 0012)
+# ======================================================================
+class CatalogItemCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    price: int = Field(ge=0, description="Precio en pesos, sin decimales")
+    currency: str = "COP"
+
+
+class CatalogItemUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    price: int | None = Field(default=None, ge=0)
+    currency: str | None = None
+    status: Literal["active", "inactive"] | None = None
+
+
+def _item_json(item: Any) -> dict[str, Any]:
+    return {
+        "id": str(item.id),
+        "name": item.name,
+        "price": item.price,
+        "currency": item.currency,
+        "status": item.status,
+    }
+
+
+@router.get("/catalog")
+async def list_catalog(business_id: BusinessId) -> list[dict[str, Any]]:
+    """Todo el catálogo, activo e inactivo. El agente solo ve los activos."""
+    async with tenant_session(business_id) as session:
+        items = await CatalogRepo(session).list_all(business_id)
+        return [_item_json(i) for i in items]
+
+
+@router.post("/catalog", status_code=201)
+async def create_catalog_item(body: CatalogItemCreate, business_id: BusinessId) -> dict[str, Any]:
+    """Alta de un producto o servicio. Desde el siguiente mensaje el agente lo puede citar."""
+    try:
+        async with tenant_session(business_id) as session:
+            item = await CatalogRepo(session).create(
+                business_id, body.name.strip(), body.price, body.currency
+            )
+            return _item_json(item)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Ya existe un ítem con ese nombre") from exc
+
+
+@router.patch("/catalog/{item_id}")
+async def update_catalog_item(
+    item_id: UUID, body: CatalogItemUpdate, business_id: BusinessId
+) -> dict[str, Any]:
+    cambios = body.model_dump(exclude_none=True)
+    if not cambios:
+        raise HTTPException(status_code=400, detail="Nada que actualizar")
+    try:
+        async with tenant_session(business_id) as session:
+            item = await CatalogRepo(session).update(business_id, item_id, cambios)
+            if item is None:
+                raise HTTPException(status_code=404, detail="Ítem no encontrado")
+            return _item_json(item)
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="Ya existe un ítem con ese nombre") from exc
+
+
+@router.delete("/catalog/{item_id}", status_code=204)
+async def delete_catalog_item(item_id: UUID, business_id: BusinessId) -> Response:
+    async with tenant_session(business_id) as session:
+        borrado = await CatalogRepo(session).delete(business_id, item_id)
+    if not borrado:
+        raise HTTPException(status_code=404, detail="Ítem no encontrado")
+    return Response(status_code=204)
 
 
 # ======================================================================
@@ -449,17 +573,52 @@ async def resolve_escalation(
 
 
 # ======================================================================
-# Responder como humano (RF-14)
+# Bandeja de conversaciones (RF-14): historial completo y respuesta humana
 # ======================================================================
-@router.post("/conversations/{conversation_id}/reply")
-async def human_reply(
-    conversation_id: UUID, body: HumanReply, business_id: BusinessId
-) -> dict[str, Any]:
+# Ventana de servicio de WhatsApp: pasadas 24h desde el ultimo mensaje del
+# cliente, solo se le puede escribir con plantillas pagas (fuera del MVP).
+VENTANA_WHATSAPP = dt.timedelta(hours=24)
+
+
+def _ventana(canal: str, ultimo_del_cliente: dt.datetime | None) -> dict[str, Any]:
     """
-    Envia un mensaje del operador al cliente y lo guarda con rol 'human'.
+    Estado de la ventana de 24h. Solo aplica a WhatsApp: el sandbox no tiene
+    restriccion porque no envia nada afuera.
+    """
+    if canal != "whatsapp":
+        return {"applies": False, "open": True, "expires_at": None}
+    if ultimo_del_cliente is None:
+        return {"applies": True, "open": False, "expires_at": None}
+    vence = ultimo_del_cliente + VENTANA_WHATSAPP
+    return {
+        "applies": True,
+        "open": dt.datetime.now(dt.UTC) < vence,
+        "expires_at": vence.isoformat(),
+    }
+
+
+def _iso(valor: dt.datetime | None) -> str | None:
+    return valor.isoformat() if valor is not None else None
+
+
+class _Destino(BaseModel):
+    """A quien y por donde sale un mensaje del operador."""
+
+    channel: str
+    channel_identifier: str
+    phone_number_id: str | None
+
+
+async def _validar_envio(business_id: UUID, conversation_id: UUID) -> _Destino:
+    """
+    Comprueba que se le pueda escribir al cliente ANTES de enviar nada.
+
+    Se valida la ventana de 24h aca y no se deja fallar a Meta: su error llega
+    como un 400 generico, y el operador necesita saber por que no salio.
     """
     async with tenant_session(business_id) as session:
-        conv = await ConversationRepo(session).get(business_id, conversation_id)
+        conv_repo = ConversationRepo(session)
+        conv = await conv_repo.get(business_id, conversation_id)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversación no encontrada")
 
@@ -467,30 +626,312 @@ async def human_reply(
         if cliente is None:
             raise HTTPException(status_code=404, detail="Cliente no encontrado")
 
-        await MessageRepo(session).append(
-            business_id, conversation_id, MessageRole.HUMAN, body.text
-        )
-        if body.return_to_auto:
-            await ConversationRepo(session).set_status(
-                business_id, conversation_id, ConversationStatus.AUTO
+        ultimo = await conv_repo.last_customer_message_at(business_id, conversation_id)
+        numero = (
+            await session.execute(
+                select(Business.whatsapp_phone_number_id).where(Business.id == business_id)
             )
-        destino = cliente.channel_identifier
-        canal = cliente.channel
+        ).scalar_one_or_none()
 
-    if canal == "whatsapp":
+    if not _ventana(cliente.channel, ultimo)["open"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Pasaron más de 24 horas desde el último mensaje del cliente: "
+                "WhatsApp no permite escribirle hasta que vuelva a escribir."
+            ),
+        )
+
+    return _Destino(
+        channel=cliente.channel,
+        channel_identifier=cliente.channel_identifier,
+        # El numero del negocio, no el global de la config: cada tenant responde
+        # desde su propio numero.
+        phone_number_id=numero,
+    )
+
+
+async def _registrar_envio(
+    business_id: UUID,
+    conversation_id: UUID,
+    texto: str,
+    return_to_auto: bool,
+    imagen: tuple[bytes, str] | None = None,
+) -> None:
+    """
+    Guarda lo que el operador ya envio y actualiza quien atiende.
+
+    Escribir al cliente desde la bandeja es tomar la conversacion: queda en modo
+    humano y el agente deja de responder, salvo que se pida devolverla. Sin esto,
+    el agente le contestaria al cliente encima de la persona.
+    """
+    async with tenant_session(business_id) as session:
+        if imagen is not None:
+            mensaje = await MessageRepo(session).append(
+                business_id,
+                conversation_id,
+                MessageRole.HUMAN,
+                texto,
+                content_type=ContentType.IMAGE,
+            )
+            datos, mime_type = imagen
+            await MediaRepo(session).create(business_id, mensaje.id, mime_type, datos)
+        else:
+            await MessageRepo(session).append(
+                business_id, conversation_id, MessageRole.HUMAN, texto
+            )
+
+        await _cambiar_estado(
+            session,
+            business_id,
+            conversation_id,
+            ConversationStatus.AUTO if return_to_auto else ConversationStatus.HUMAN,
+        )
+
+
+async def _cambiar_estado(
+    session: AsyncSession, business_id: UUID, conversation_id: UUID, nuevo: ConversationStatus
+) -> None:
+    """Devolver al agente tambien cierra el escalamiento abierto: el caso terminó."""
+    await ConversationRepo(session).set_status(business_id, conversation_id, nuevo)
+    if nuevo == ConversationStatus.AUTO:
+        await EscalationRepo(session).resolve_open_for_conversation(
+            business_id, conversation_id
+        )
+
+
+@router.get("/conversations")
+async def list_conversations(
+    business_id: BusinessId,
+    status_filter: Annotated[ConversationStatus | None, Query(alias="status")] = None,
+    search: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[dict[str, Any]]:
+    """Bandeja: conversaciones por actividad reciente, con no leídos y ventana."""
+    async with tenant_session(business_id) as session:
+        filas = await ConversationRepo(session).list_inbox(
+            business_id, status=status_filter, search=search, limit=limit
+        )
+
+    return [
+        {
+            "id": str(f["id"]),
+            "status": f["status"],
+            "channel": f["channel"],
+            "last_message_at": _iso(f["last_message_at"] or f["created_at"]),
+            "customer": {
+                "id": str(f["customer_id"]),
+                "display_name": f["display_name"],
+                "channel_identifier": f["channel_identifier"],
+            },
+            "last_message": (
+                {
+                    "role": f["last_role"],
+                    "content_type": f["last_content_type"],
+                    "content": f["last_content"],
+                }
+                if f["last_role"] is not None
+                else None
+            ),
+            "unread": int(f["unread"] or 0),
+            "open_escalation": (
+                {"id": str(f["open_escalation_id"]), "reason": f["open_escalation_reason"]}
+                if f["open_escalation_id"] is not None
+                else None
+            ),
+            "window": _ventana(f["channel"], f["last_customer_message_at"]),
+        }
+        for f in filas
+    ]
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: UUID,
+    business_id: BusinessId,
+    after_seq: int | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> dict[str, Any]:
+    """
+    Detalle para la bandeja: cliente, estado, ventana de 24h e historial.
+
+    Con `after_seq` devuelve solo los mensajes nuevos: es lo que pide el panel
+    en cada refresco. No marca como leído (GET sin efectos): eso es `/read`.
+    """
+    async with tenant_session(business_id) as session:
+        conv_repo = ConversationRepo(session)
+        conv = await conv_repo.get(business_id, conversation_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="Conversación no encontrada")
+
+        cliente = await CustomerRepo(session).get(business_id, conv.customer_id)
+        if cliente is None:
+            raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+        mensajes = await MessageRepo(session).list_for_inbox(
+            business_id, conversation_id, after_seq=after_seq, limit=limit
+        )
+        ultimo = await conv_repo.last_customer_message_at(business_id, conversation_id)
+        escalamiento = await EscalationRepo(session).open_for_conversation(
+            business_id, conversation_id
+        )
+
+    return {
+        "id": str(conv.id),
+        "status": conv.status,
+        "channel": conv.channel,
+        "created_at": _iso(conv.created_at),
+        "last_message_at": _iso(conv.last_message_at),
+        "customer": {
+            "id": str(cliente.id),
+            "display_name": cliente.display_name,
+            "channel_identifier": cliente.channel_identifier,
+            "created_at": _iso(cliente.created_at),
+            "last_seen_at": _iso(cliente.last_seen_at),
+        },
+        "open_escalation": (
+            {
+                "id": str(escalamiento.id),
+                "reason": escalamiento.reason,
+                "created_at": _iso(escalamiento.created_at),
+            }
+            if escalamiento is not None
+            else None
+        ),
+        "window": _ventana(conv.channel, ultimo),
+        "messages": [
+            {
+                "id": str(m["id"]),
+                "seq": m["seq"],
+                "role": m["role"],
+                "content_type": m["content_type"],
+                "content": m["content"],
+                "transcription_status": m.get("transcription_status"),
+                "created_at": _iso(m["created_at"]),
+                "media_id": str(m["media_id"]) if m["media_id"] else None,
+                "media_mime_type": m["media_mime_type"],
+            }
+            for m in mensajes
+        ],
+    }
+
+
+@router.post("/conversations/{conversation_id}/read", status_code=204)
+async def mark_conversation_read(conversation_id: UUID, business_id: BusinessId) -> None:
+    async with tenant_session(business_id) as session:
+        conv_repo = ConversationRepo(session)
+        if await conv_repo.get(business_id, conversation_id) is None:
+            raise HTTPException(status_code=404, detail="Conversación no encontrada")
+        await conv_repo.mark_read(business_id, conversation_id)
+
+
+@router.post("/conversations/{conversation_id}/status")
+async def change_conversation_status(
+    conversation_id: UUID, body: ConversationStatusChange, business_id: BusinessId
+) -> dict[str, Any]:
+    """
+    Tomar la conversación (`human`: el agente calla) o devolverla al agente
+    (`auto`: además cierra el escalamiento abierto).
+    """
+    async with tenant_session(business_id) as session:
+        if await ConversationRepo(session).get(business_id, conversation_id) is None:
+            raise HTTPException(status_code=404, detail="Conversación no encontrada")
+        await _cambiar_estado(session, business_id, conversation_id, body.status)
+
+    return {"id": str(conversation_id), "status": body.status.value}
+
+
+@router.post("/conversations/{conversation_id}/reply")
+async def human_reply(
+    conversation_id: UUID, body: HumanReply, business_id: BusinessId
+) -> dict[str, Any]:
+    """
+    Envía un mensaje del operador al cliente y lo guarda con rol 'human'.
+
+    Primero se envía y después se guarda: si WhatsApp lo rechaza, el historial no
+    muestra un mensaje que el cliente nunca recibió.
+    """
+    texto = body.text.strip()
+    if not texto:
+        raise HTTPException(status_code=422, detail="El mensaje está vacío")
+
+    destino = await _validar_envio(business_id, conversation_id)
+
+    if destino.channel == "whatsapp":
         try:
             await send_whatsapp_reply(
                 OutboundMessage(
                     business_id=business_id,
-                    channel=canal,
-                    channel_identifier=destino,
-                    text=body.text,
-                )
+                    channel=destino.channel,
+                    channel_identifier=destino.channel_identifier,
+                    text=texto,
+                ),
+                phone_number_id=destino.phone_number_id,
             )
         except WhatsAppError as exc:
             raise HTTPException(status_code=502, detail=f"No se pudo enviar: {exc}") from exc
 
+    await _registrar_envio(business_id, conversation_id, texto, body.return_to_auto)
     return {"sent": True, "returned_to_auto": body.return_to_auto}
+
+
+@router.post("/conversations/{conversation_id}/reply-image")
+async def human_reply_image(
+    conversation_id: UUID, body: ImageReply, business_id: BusinessId
+) -> dict[str, Any]:
+    """
+    Envía una imagen (con pie de foto opcional) del operador al cliente.
+
+    La imagen viaja en base64 dentro del JSON en vez de multipart: evita sumar
+    `python-multipart` como dependencia para un único endpoint, y con el tope de
+    5 MB el sobrecosto de base64 no importa.
+    """
+    try:
+        datos = base64.b64decode(body.image_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="La imagen no es base64 válido") from exc
+
+    try:
+        check_image(datos, body.mime_type)
+    except InvalidMedia as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    pie = body.caption.strip()
+    destino = await _validar_envio(business_id, conversation_id)
+
+    if destino.channel == "whatsapp":
+        try:
+            await send_whatsapp_image(
+                destino.channel_identifier,
+                datos,
+                body.mime_type,
+                caption=pie,
+                phone_number_id=destino.phone_number_id,
+            )
+        except WhatsAppError as exc:
+            raise HTTPException(status_code=502, detail=f"No se pudo enviar: {exc}") from exc
+
+    await _registrar_envio(
+        business_id, conversation_id, pie, body.return_to_auto, imagen=(datos, body.mime_type)
+    )
+    return {"sent": True, "returned_to_auto": body.return_to_auto}
+
+
+@router.get("/media/{media_id}")
+async def get_media(media_id: UUID, business_id: BusinessId) -> Response:
+    """El archivo de un mensaje. Mismo aislamiento que todo: token -> tenant -> RLS."""
+    async with tenant_session(business_id) as session:
+        media = await MediaRepo(session).get(business_id, media_id)
+        if media is None:
+            raise HTTPException(status_code=404, detail="Archivo no encontrado")
+        datos, mime_type = bytes(media.data), media.mime_type
+
+    return Response(
+        content=datos,
+        media_type=mime_type,
+        # Privado: son fotos de clientes, ningun proxy intermedio debe guardarlas.
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 # ======================================================================
@@ -705,7 +1146,7 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
     asi lo que se ve aca es lo que va a pasar en produccion. Devuelve ademas la
     intencion detectada y las herramientas usadas, para poder depurar.
     """
-    from app.core.orchestrator import handle_inbound_message
+    from app.core.orchestrator import TurnOutcomeKind, handle_inbound_message
     from app.schemas import InboundMessage
 
     inbound = InboundMessage(
@@ -717,9 +1158,21 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
         received_at=dt.datetime.now(dt.UTC),
     )
 
-    await handle_inbound_message(inbound)
+    # El orquestador dice cómo terminó el turno: no se adivina leyendo "el último
+    # mensaje", que es el del propio cliente cuando el agente calla.
+    resultado = await handle_inbound_message(inbound)
 
-    # Se lee el turno recien registrado para devolver la traza completa.
+    motivos_sin_respuesta = {
+        TurnOutcomeKind.GROUPED: (
+            "El cliente siguió escribiendo: este mensaje se responde junto con los "
+            "siguientes, en una sola respuesta."
+        ),
+        TurnOutcomeKind.HUMAN_MODE: (
+            "La conversación está en modo humano: el agente no responde hasta que "
+            "una persona la devuelva al agente desde la bandeja."
+        ),
+    }
+
     async with tenant_session(business_id) as session:
         cliente = await CustomerRepo(session).get_by_identifier(
             business_id, "sandbox", body.customer_identifier
@@ -731,19 +1184,19 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
             business_id, cliente.id, "sandbox"
         )
 
-        log = (
-            await session.execute(
-                select(TurnLog)
-                .where(
-                    TurnLog.business_id == business_id,
-                    TurnLog.conversation_id == conv.id,
+        # La traza de ESTE mensaje, no la del último turno de la conversación.
+        log = None
+        if resultado.message_in_id is not None:
+            log = (
+                await session.execute(
+                    select(TurnLog)
+                    .where(
+                        TurnLog.business_id == business_id,
+                        TurnLog.message_in_id == resultado.message_in_id,
+                    )
+                    .limit(1)
                 )
-                .order_by(TurnLog.created_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-
-        turnos = await MessageRepo(session).recent(business_id, conv.id, limit=1)
+            ).scalar_one_or_none()
 
         agente_nombre = None
         if log is not None and log.routed_agent_id:
@@ -751,7 +1204,13 @@ async def sandbox_message(body: SandboxMessage, business_id: BusinessId) -> Sand
             agente_nombre = agente.name if agente else None
 
     return SandboxResponse(
-        reply_text=turnos[-1].content if turnos else "",
+        reply_text=resultado.reply_text or "",
+        replied=resultado.replied,
+        outcome=resultado.kind.value,
+        reply_message_id=log.message_out_id if log else None,
+        no_reply_reason=None if resultado.replied else motivos_sin_respuesta.get(
+            resultado.kind, "El agente no respondió este mensaje."
+        ),
         detected_intent=log.detected_intent if log else None,
         routed_agent=agente_nombre,
         tools_used=list(log.tools_used) if log and log.tools_used else [],
